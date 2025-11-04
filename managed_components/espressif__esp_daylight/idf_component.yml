@@ -1,0 +1,10 @@
+dependencies:
+  idf: '>=5.1'
+description: NOAA-based sunrise/sunset calculation library for ESP-IDF
+issues: https://github.com/espressif/esp-rainmaker/issues
+repository: git://github.com/espressif/esp-rainmaker.git
+repository_info:
+  commit_sha: 0702ea4ddce95a3d94e0a90f5203d3084700d33e
+  path: components/esp_daylight
+url: https://github.com/espressif/esp-rainmaker/tree/master/components/esp_daylight
+version: 1.0.0

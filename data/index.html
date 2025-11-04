@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Configuración ESP32</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 10px;
+      background-color: #f0f0f0;
+    }
+    .tabs {
+      display: flex;
+      margin-bottom: 10px;
+    }
+    .tab-button {
+      padding: 8px 12px;
+      cursor: pointer;
+      background: #ddd;
+      border: 1px solid #aaa;
+      border-bottom: none;
+      margin-right: 4px;
+      border-radius: 4px 4px 0 0;
+      font-size: 14px;
+    }
+    .tab-button.active {
+      background: #fff;
+      font-weight: bold;
+    }
+    .tab {
+      display: none;
+      border: 1px solid #aaa;
+      padding: 10px;
+      background: #fff;
+      border-radius: 0 4px 4px 4px;
+    }
+    .tab.active {
+      display: block;
+    }
+    label {
+      display: block;
+      margin-top: 8px;
+      font-size: 14px;
+    }
+    input[type="text"], input[type="password"], select {
+      width: 100%;
+      padding: 4px;
+      margin-top: 2px;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+    .checkbox {
+      margin-top: 10px;
+    }
+    button.save-button {
+      margin-top: 12px;
+      width: 100%;
+      padding: 8px;
+      font-size: 14px;
+      background-color: #28a745;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button.save-button:hover {
+      background-color: #218838;
+    }
+    .wifi-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .wifi-row button {
+      padding: 5px 8px;
+      font-size: 14px;
+    }
+    .wifi-block, .espnow-block {
+      max-width: 400px;
+      margin: 0 auto;
+      padding: 10px 14px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      background-color: #ffffff;
+      box-shadow: 2px 2px 4px rgba(0,0,0,0.05);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>Panel de Configuración</h2>
+
+  <div class="tabs">
+    <button class="tab-button active" onclick="showTab('red')">Red</button>
+    <button class="tab-button" onclick="showTab('bus')">Bus</button>
+    <button class="tab-button" onclick="showTab('pantallas')">Pantallas</button>
+  </div>
+
+  <div id="red" class="tab active">
+    <div class="wifi-block">
+      <h3>Configuración WiFi</h3>
+      <label>Red WiFi (SSID):</label>
+      <div class="wifi-row">
+        <select id="ssidSelect" onchange="setSSIDFromList()">
+          <option value="">-- Selecciona una red --</option>
+        </select>
+        <button type="button" onclick="escanearWifi()">🔍</button>
+      </div>
+      <label>o escribir SSID manualmente:</label>
+      <input type="text" id="ssid" placeholder="SSID personalizado">
+
+      <label>Contraseña:</label>
+      <input type="password" id="password" placeholder="********">
+
+      <label class="checkbox">
+        <input type="checkbox" id="enable_wifi" onchange="toggleWifiFields()"> Habilitar WiFi
+      </label>
+
+      <button class="save-button" onclick="guardar()">💾 Guardar</button>
+    </div>
+  </div>
+
+  <div id="bus" class="tab">
+    <h3>Otras configuraciones</h3>
+    <p>Aquí puedes añadir futuras configuraciones (Ethernet, RS485, etc).</p>
+  </div>
+
+  <div id="pantallas" class="tab">
+    <div class="espnow-block">
+      <h3>Pantallas ESP-NOW</h3>
+      <p>Pulsa el botón para iniciar el emparejamiento de pantallas conectadas por ESP-NOW.</p>
+      <button class="save-button" onclick="iniciarPairing()">🔗 Emparejar pantallas</button>
+    </div>
+  </div>
+
+  <script>
+    function showTab(id) {
+      document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+      document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+      document.getElementById(id).classList.add('active');
+      document.querySelector(`.tab-button[onclick="showTab('${id}')"]`).classList.add('active');
+    }
+
+    function setSSIDFromList() {
+      const selected = document.getElementById("ssidSelect").value;
+      document.getElementById("ssid").value = selected;
+    }
+
+    function toggleWifiFields() {
+      const enabled = document.getElementById('enable_wifi').checked;
+      document.getElementById('ssidSelect').disabled = !enabled;
+      document.getElementById('ssid').disabled = !enabled;
+      document.getElementById('password').disabled = !enabled;
+    }
+
+    function guardar() {
+      const config = {
+        ssid: document.getElementById('ssid').value,
+        pass: document.getElementById('password').value,
+        enable: document.getElementById('enable_wifi').checked
+      };
+
+      fetch('/guardar-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config)
+      })
+      .then(res => res.text())
+      .then(text => {
+        alert('✅ Configuración guardada');
+      })
+      .catch(err => alert('❌ Error de red: ' + err));
+    }
+
+    function escanearWifi() {
+      const select = document.getElementById("ssidSelect");
+      select.innerHTML = '<option>🔄 Buscando redes WiFi...</option>';
+      select.disabled = true;
+
+      fetch('/escanear-wifi')
+        .then(() => {
+          setTimeout(() => {
+            fetch('/escanear-wifi')
+              .then(res => res.json())
+              .then(data => {
+                select.innerHTML = '<option value="">-- Selecciona una red --</option>';
+                data.forEach(red => {
+                  const opt = document.createElement("option");
+                  opt.value = red.ssid;
+                  opt.text = `${red.ssid} (${red.rssi} dBm)`;
+                  select.appendChild(opt);
+                });
+                select.disabled = false;
+              });
+          }, 2000);
+        })
+        .catch(err => {
+          console.warn("❌ Error al escanear SSID", err);
+          select.innerHTML = '<option>Error al escanear</option>';
+          select.disabled = false;
+        });
+    }
+
+    function cargarConfiguracionGuardada() {
+      fetch('/leer-config')
+        .then(res => res.json())
+        .then(config => {
+          document.getElementById('ssid').value = config.ssid || '';
+          document.getElementById('password').value = config.pass || '';
+          document.getElementById('enable_wifi').checked = config.enable === true;
+          toggleWifiFields();
+        })
+        .catch(err => console.warn("No se pudo cargar la configuración guardada", err));
+    }
+
+    function iniciarPairing() {
+      fetch('/iniciar-pairing')
+        .then(() => {
+          alert('🟢 Modo emparejamiento activado por 10 segundos.');
+        })
+        .catch(() => {
+          alert('❌ No se pudo activar el modo de emparejamiento');
+        });
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      cargarConfiguracionGuardada();
+    });
+  </script>
+
+</body>
+</html>

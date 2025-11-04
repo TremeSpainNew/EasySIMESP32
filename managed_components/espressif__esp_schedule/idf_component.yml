@@ -1,0 +1,14 @@
+dependencies:
+  espressif/esp_daylight:
+    version: ~1.0.0
+  espressif/rmaker_common:
+    version: ~1.5.0
+  idf: '>=5.1'
+description: ESP Schedules, used in RainMaker
+issues: https://github.com/espressif/esp-rainmaker/issues
+repository: git://github.com/espressif/esp-rainmaker.git
+repository_info:
+  commit_sha: ebe3742c0a98f3b6ea77b92e01a0ed0055eddec6
+  path: components/esp_schedule
+url: https://github.com/espressif/esp-rainmaker/tree/master/components/esp_schedule
+version: 1.3.1

@@ -1,0 +1,148 @@
+#include <Arduino.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <WiFi.h>
+
+// ==========================
+// CONFIGURACIÓN
+// ==========================
+#define BOARD_ID 1
+#define CHANNEL 1 // Canal fijo para todos
+
+typedef enum MessageType { PAIRING = 0, DATA = 1 } MessageType;
+
+typedef struct struct_message {
+  uint8_t msgType;  // 0 = PAIRING, 1 = DATA
+  uint8_t id;
+  float temp;
+  float hum;
+  unsigned int readingId;
+} struct_message;
+
+typedef struct struct_pairing {
+  uint8_t msgType;
+  uint8_t id;
+  uint8_t macAddr[6];
+  uint8_t channel;
+} struct_pairing;
+
+struct_message myData;
+struct_message inData;
+struct_pairing pairingData;
+bool paired = false;
+unsigned int readingId = 0;
+
+// ==========================
+// UTILIDADES
+// ==========================
+void printMAC(const uint8_t *mac_addr) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr),
+           "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac_addr[0], mac_addr[1], mac_addr[2],
+           mac_addr[3], mac_addr[4], mac_addr[5]);
+  Serial.print(macStr);
+}
+
+bool addPeer(const uint8_t *peer_addr) {
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, peer_addr, 6);
+  peerInfo.channel = CHANNEL;
+  peerInfo.encrypt = false;
+
+  if (!esp_now_is_peer_exist(peerInfo.peer_addr)) {
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("❌ Error al agregar peer");
+      return false;
+    }
+  }
+  Serial.print("✅ Peer agregado: ");
+  printMAC(peer_addr);
+  Serial.println();
+  return true;
+}
+
+// ==========================
+// CALLBACKS
+// ==========================
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("📤 Envío a ");
+  printMAC(mac_addr);
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? " -> Éxito" : " -> Error");
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len < 1) return;
+  uint8_t type = data[0];
+
+  if (type == DATA) {
+    memcpy(&inData, data, sizeof(inData));
+    Serial.printf("📥 Data de %d: Temp=%.2f Hum=%.2f\n",
+                  inData.id, inData.temp, inData.hum);
+  } 
+  else if (type == PAIRING) {
+    memcpy(&pairingData, data, sizeof(pairingData));
+    Serial.print("🔗 Emparejamiento solicitado por: ");
+    printMAC(pairingData.macAddr);
+    Serial.println();
+
+    if (addPeer(pairingData.macAddr)) {
+      // Responder al esclavo para confirmar emparejamiento
+      struct_pairing response;
+      response.msgType = PAIRING;
+      response.id = 0;  // 0 = Maestro
+      memcpy(response.macAddr, pairingData.macAddr, 6);
+      response.channel = CHANNEL;
+      esp_now_send(pairingData.macAddr, (uint8_t *)&response, sizeof(response));
+      paired = true;
+      Serial.println("✅ Emparejamiento confirmado");
+    }
+  }
+}
+
+// ==========================
+// SETUP
+// ==========================
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  // Mostrar MAC del maestro
+  uint8_t masterMac[6];
+  esp_wifi_get_mac(WIFI_IF_AP, masterMac);
+  Serial.print("MAC del Maestro (AP): ");
+  printMAC(masterMac);
+  Serial.println();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ Error al iniciar ESP-NOW");
+    ESP.restart();
+  }
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
+
+  Serial.println("✅ Maestro listo y esperando pairing...");
+}
+
+// ==========================
+// LOOP
+// ==========================
+void loop() {
+  static unsigned long lastSend = 0;
+
+  if (millis() - lastSend > 5000) {
+    if (paired) {
+      myData.msgType = DATA;
+      myData.id = BOARD_ID;
+      myData.temp = random(20, 30);
+      myData.hum = random(40, 60);
+      myData.readingId = readingId++;
+      esp_now_send(pairingData.macAddr, (uint8_t *)&myData, sizeof(myData));
+    } else {
+      Serial.println("⏳ Esperando emparejamiento...");
+    }
+    lastSend = millis();
+  }
+}

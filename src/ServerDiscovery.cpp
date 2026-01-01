@@ -157,7 +157,7 @@ void ServerDiscovery::handleUdp_() {
 
     // Solo tomar la primera IP detectada Y cuyo payload coincida con "Train Simulator Server"
     if (!hasServerIp_) {
-      if (msg.startsWith("Train Simulator Server")) {
+      if (msg.startsWith("Train Simulator Server") || msg.startsWith("Train Simulator Socket")) {
         serverIp_        = rip;
         hasServerIp_     = true;
         cooldownActive_  = false;

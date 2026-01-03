@@ -15,20 +15,18 @@
 #include <Adafruit_NeoPixel.h>
 #include <ctype.h>
 #include "nvs_flash.h"
-#include <Menu.h>
+//#include <Menu.h>
 //#include <ElegantOTA.h>      // NUEVO: ElegantOTA para actualizaciones vía web
 #include <math.h>               // isnan, fabs, lroundf
 #include <Adafruit_ADS1X15.h>   // ADS1115
 #include <WiFiUdp.h>            // UDP para discover (usado dentro de ServerDiscovery normalmente)
-
 #include "EthernetInterface.h"  // interfaz TCP puerto 5000
 #include <ServerDiscovery.h>    // NUEVO: discover+cliente 5090 con callbacks
-
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+//#include <Adafruit_GFX.h>
+//#include <Adafruit_SSD1306.h>
 //#include <Fonts/FreeSerif9pt7b.h>
 //#include <Adafruit_SH110X.h>
-//#include <U8g2lib.h>
+#include <U8g2lib.h>
 
 
 // ---------------- Wrappers para la API nueva de EE ----------------
@@ -140,9 +138,43 @@ static inline void modbusRefreshWindow() { modbusInitWindowFromUsed(); }
 #define EEPROM_MAX_ENTRIES 132
 #endif
 
+// ======================= Estructura de configuración de pin =======================
+
+struct __attribute__((packed)) PinConfig {
+  uint8_t  pin;
+  uint8_t  type;            // 0 SWITCH, 1 BUTTON, 2 OUTPUT, 3 POT, 4 SELECTOR
+  char     param[40];
+  int      minIn, maxIn;
+  float    minOut, maxOut;
+  float    suavizado;
+  uint8_t  modoEnvio;       // 0 CONTINUO, 1 CAMBIO, 2 INTERVALO, 3 MANUAL
+  uint16_t intervalo;       // para INTERVALO o fixed-point THRESH en CAMBIO
+  bool     enviarComoEntero;
+};
+
+// ======================= Instancias de IO =======================
+SwitchMCP*        switches[EEPROM_MAX_ENTRIES];
+PushButtonMCP*    buttons[EEPROM_MAX_ENTRIES];
+OutputManagerMCP* outputs[EEPROM_MAX_ENTRIES];
+
+IOPin* switchPins[EEPROM_MAX_ENTRIES];
+IOPin* buttonPins[EEPROM_MAX_ENTRIES];
+IOPin* outputPins[EEPROM_MAX_ENTRIES];
+
+const char* switchParams[EEPROM_MAX_ENTRIES];
+const char* buttonParams[EEPROM_MAX_ENTRIES];
+const char* outputParams[EEPROM_MAX_ENTRIES];
+const char* potParams[EEPROM_MAX_ENTRIES];
+
+uint8_t switchPinNum[EEPROM_MAX_ENTRIES];
+uint8_t buttonPinNum[EEPROM_MAX_ENTRIES];
+uint8_t outputPinNum[EEPROM_MAX_ENTRIES];
+
+int switchCount = 0, buttonCount = 0, potCount = 0, outputCount = 0;
+
 // ======================= AP/LED (MOVIDO ARRIBA para oledDrawStatus) =======================
 // ===== Botones ESP32 =====
-#define PIN_BTN_OLED  7   // cambia pantalla
+#define PIN_BTN_OLED  0   // cambia pantalla
 #define PIN_BTN_AP    15  // AP (long press)
 
 // páginas OLED
@@ -165,13 +197,13 @@ static const uint16_t kClientServerPort = 5090;
 ServerDiscovery serverDiscovery(5091,5090); // la clase hace discover UDP+TCP 5090
 
 // ======================= OLED SSD1306 =======================
-#define OLED_ADDR   0x3C
+#define OLED_ADDR   0x78
 #define OLED_W      128
 #define OLED_H      64
 #define OLED_RESET  -1   // sin pin reset
 
-Adafruit_SSD1306 display(OLED_W, OLED_H, &I2CBUS1, OLED_RESET);
-//U8G2_SSD1306_128X64_NONAME_F_2ND_HW_I2C display(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+//Adafruit_SSD1306 display(OLED_W, OLED_H, &I2CBUS1, OLED_RESET);
+U8G2_SSD1309_128X64_NONAME2_F_SW_I2C display(U8G2_R0, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA, /* reset=*/ U8X8_PIN_NONE);
 //Adafruit_SH1106G display(128, 64, &Wire, -1);
 
 static bool oledOK = false;
@@ -191,54 +223,171 @@ static inline void oledRequest() {
 static void pollButtonsESP32() {
   const unsigned long now = millis();
   const unsigned long DEBOUNCE_MS = 50;
-  const unsigned long LONG_MS = 2000; // AP long press
 
-  // ---- BTN OLED: pulsación corta -> cambia página ----
+  // Ventana de doble click (ajusta a gusto)
+  const unsigned long DC_WINDOW_MS = 350;
+
+  // ---- BTN OLED (BOOT): 1 click cambia pantalla, doble click toggle AP ----
   {
-    int raw = digitalRead(PIN_BTN_OLED);
-    if (raw != lastOledBtn) {
-      oledBtnStableMs = now;
-      lastOledBtn = raw;
-    }
-    if (now - oledBtnStableMs >= DEBOUNCE_MS) {
-      static int stable = HIGH;
-      if (raw != stable) {
-        stable = raw;
-        if (stable == LOW) { // press
-          oledPage = (oledPage == OLED_PAGE_NET) ? OLED_PAGE_IO : OLED_PAGE_NET;
-          oledRequest(); // fuerza redraw
+    static int stable = HIGH;
+    static unsigned long lastChangeMs = 0;
+
+    static uint8_t clickCount = 0;
+    static unsigned long firstClickMs = 0;
+
+    int raw = digitalRead(PIN_BTN_OLED); // BOOT normalmente GPIO0 (LOW=pressed)
+
+    // Debounce básico
+    if (raw != stable && (now - lastChangeMs) >= DEBOUNCE_MS) {
+      stable = raw;
+      lastChangeMs = now;
+
+      if (stable == LOW) {
+        // Se ha pulsado (flanco)
+        if (clickCount == 0) {
+          clickCount = 1;
+          firstClickMs = now;
+        } else {
+          // Segundo click dentro de ventana => doble click
+          if ((now - firstClickMs) <= DC_WINDOW_MS) {
+            clickCount = 0;
+
+            // ✅ DOBLE CLICK: toggle AP
+            if (!apActive) enableAP();
+            else           disableAP();
+
+            oledRequest();
+          } else {
+            // Demasiado tarde: esto cuenta como “nuevo primer click”
+            clickCount = 1;
+            firstClickMs = now;
+          }
         }
       }
     }
-  }
 
-  // ---- BTN AP: long press -> toggle AP ----
-  {
-    int raw = digitalRead(PIN_BTN_AP);
-    if (raw != lastApBtn) {
-      apBtnStableMs = now;
-      lastApBtn = raw;
-    }
-    if (now - apBtnStableMs >= DEBOUNCE_MS) {
-      static int stable = HIGH;
-      static bool longDone = false;
+    // Si ha pasado la ventana sin segundo click => es single click
+    if (clickCount == 1 && (now - firstClickMs) > DC_WINDOW_MS) {
+      clickCount = 0;
 
-      if (raw != stable) {
-        stable = raw;
-        if (stable == LOW) { apPressStart = now; longDone = false; }
-        else { apPressStart = 0; longDone = false; }
-      }
-
-      if (stable == LOW && !longDone && apPressStart && (now - apPressStart >= LONG_MS)) {
-        if (!apActive) enableAP();
-        else           disableAP();
-        longDone = true;
-        oledRequest();
-      }
+      // ✅ SINGLE CLICK: cambia página
+      oledPage = (oledPage == OLED_PAGE_NET) ? OLED_PAGE_IO : OLED_PAGE_NET;
+      oledRequest();
     }
   }
+
+  // ---- BTN AP: si lo vas a dejar, quítalo o ignóralo (porque ahora AP va por doble click) ----
+  // Si quieres, puedes comentar/eliminar el bloque de PIN_BTN_AP para evitar confusión.
 }
 
+enum IoKind : uint8_t { IO_SW=0, IO_BTN=1, IO_OUT=2 };
+
+struct IoItem {
+  IoKind kind;
+  uint8_t pin;          // pin global 0..127
+  const char* name;     // param (texto)
+  IOPin* io;            // puntero pin
+};
+
+// Pagina interna de IO (si hay muchos)
+static uint8_t oledIoSubPage = 0;
+
+static bool ioIsActive(const IoItem& it) {
+  if (!it.io) return false;
+
+  // Entradas con pullup: activo cuando LOW
+  if (it.kind == IO_SW || it.kind == IO_BTN) {
+    return it.io->digitalRead() == LOW;
+  }
+
+  // Salidas: si tu MCPPin soporta leer el estado real, esto sirve.
+  // Si no, te digo abajo cómo hacerlo con “shadow”.
+  return it.io->digitalRead() == HIGH;
+}
+
+static int buildIoItems(IoItem* out, int maxItems) {
+  int n = 0;
+
+  for (int i=0; i<switchCount && n<maxItems; ++i) {
+    out[n++] = { IO_SW, switchPinNum[i], switchParams[i], switchPins[i] };
+  }
+  for (int i=0; i<buttonCount && n<maxItems; ++i) {
+    out[n++] = { IO_BTN, buttonPinNum[i], buttonParams[i], buttonPins[i] };
+  }
+  for (int i=0; i<outputCount && n<maxItems; ++i) {
+    out[n++] = { IO_OUT, outputPinNum[i], outputParams[i], outputPins[i] };
+  }
+
+  return n;
+}
+
+static void oledDrawIOPage() {
+  if (!oledOK) return;
+
+  static IoItem items[256];
+  const int total = buildIoItems(items, 256);
+
+  // 16 por página (4x4)
+  const int PER_PAGE = 16;
+  int pages = (total + PER_PAGE - 1) / PER_PAGE;
+  if (pages < 1) pages = 1;
+
+  if (oledIoSubPage >= (uint8_t)pages) oledIoSubPage = 0;
+
+  int start = oledIoSubPage * PER_PAGE;
+  int end   = start + PER_PAGE;
+  if (end > total) end = total;
+
+  display.clearBuffer();
+  display.setFont(u8g2_font_5x8_tf);
+
+  // Encabezado
+  char hdr[32];
+  snprintf(hdr, sizeof(hdr), "IO %d/%d  (tot:%d)", (int)oledIoSubPage+1, pages, total);
+  display.drawStr(0, 7, hdr);
+
+  // Grid: 4 columnas x 4 filas
+  const int COLS = 4;
+  const int ROWS = 4;
+  const int cellW = 128 / COLS;   // 32
+  const int cellH = 14;           // 14px por fila (cabe justo)
+  const int y0 = 12;
+
+  int idx = start;
+  for (int r=0; r<ROWS; r++) {
+    for (int c=0; c<COLS; c++) {
+      if (idx >= end) break;
+
+      const IoItem& it = items[idx];
+      bool on = ioIsActive(it);
+
+      int x = c * cellW;
+      int y = y0 + r * cellH;
+
+      // círculo en (x+4, y+5)
+      int cx = x + 6;
+      int cy = y + 6;
+      int rad = 4;
+
+      display.drawCircle(cx, cy, rad);
+      if (on) display.drawDisc(cx, cy, rad-1);
+
+      // etiqueta tipo + pin (ej: S12, B07, O45)
+      char tag[10];
+      char k = (it.kind==IO_SW) ? 'S' : (it.kind==IO_BTN) ? 'B' : 'O';
+
+      // si no tienes pin global aquí, pon el índice o el param corto
+      uint8_t p = it.pin;
+      if (p == 255) snprintf(tag, sizeof(tag), "%c??", k);
+      else          snprintf(tag, sizeof(tag), "%c%u", k, (unsigned)p);
+
+      display.drawStr(x + 14, y + 8, tag);
+
+      idx++;
+    }
+  }
+  display.sendBuffer();
+}
 
 static String buildOledFrame() {
   bool linkUp = ETH.linkUp();
@@ -286,7 +435,7 @@ static void scanBus(TwoWire &bus, const char* name) {
   if (!found) Serial.println("❌ No se encontraron dispositivos en este bus.");
 }
 
-static void oledMaybeDrawChangeOnly() {
+/*static void oledMaybeDrawChangeOnly() {
   if (!oledOK) return;
 
   const unsigned long now = millis();
@@ -302,9 +451,7 @@ static void oledMaybeDrawChangeOnly() {
   lastOledDraw  = now;
 
   // ---- DIBUJO ----
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  display.clearBuffer ();
   display.setCursor(0,0);
 
   int start = 0;
@@ -327,45 +474,49 @@ static void oledMaybeDrawChangeOnly() {
   }
 
   display.display();
-}
+}*/
 
-/*static void oledForceDrawDebug() {
-  if (!oledOK) return;
-
-  static unsigned long last = 0;
-  unsigned long now = millis();
-  if (now - last < 500) return;   // refresco fijo cada 500ms
-  last = now;
-
-  // Intento de lock (debug)
-  if (!i2cTryLock()) {
-    Serial.println("[OLED] I2C BUSY -> no dibujo");
-    return;
-  }
-
-  String frame = buildOledFrame();
-
-  Serial.println("[OLED] DIBUJO");
-  Serial.println(frame);
-
+static void oledDrawNetPage_U8G2(const String& frame) {
   display.clearBuffer();
   display.setFont(u8g2_font_5x8_tf);
 
   int y = 8;
   int start = 0;
-  while (start < frame.length()) {
+  while (start < (int)frame.length()) {
     int nl = frame.indexOf('\n', start);
     String line = (nl >= 0) ? frame.substring(start, nl) : frame.substring(start);
     display.drawStr(0, y, line.c_str());
     y += 9;
+    if (y > 63) break;
     if (nl < 0) break;
     start = nl + 1;
-    if (y > 64) break;
   }
 
   display.sendBuffer();
-  i2cUnlock();
-}*/
+}
+
+static void oledMaybeDrawChangeOnly() {
+  if (!oledOK) return;
+
+  const unsigned long now = millis();
+  if (now - lastOledDraw < OLED_MIN_MS) return;
+
+  if (oledPage == OLED_PAGE_IO) {
+    oledDrawIOPage();           // <-- tu página de círculos
+    lastOledDraw = now;
+    return;
+  }
+
+  String frame = buildOledFrame();
+  const bool changed   = (frame != oledLastFrame);
+  const bool keepalive = (now - lastOledDraw) >= OLED_KEEPALIVE_MS;
+  if (!changed && !keepalive) return;
+
+  oledLastFrame = frame;
+  lastOledDraw  = now;
+
+  oledDrawNetPage_U8G2(frame);
+}
 
 
 // 💡 Convención POT-ADS: pin = 128 + canal (0..3)
@@ -399,36 +550,6 @@ void adsPollCache() {
     }
   }
 }
-
-// ======================= Estructura de configuración de pin =======================
-
-struct __attribute__((packed)) PinConfig {
-  uint8_t  pin;
-  uint8_t  type;            // 0 SWITCH, 1 BUTTON, 2 OUTPUT, 3 POT, 4 SELECTOR
-  char     param[40];
-  int      minIn, maxIn;
-  float    minOut, maxOut;
-  float    suavizado;
-  uint8_t  modoEnvio;       // 0 CONTINUO, 1 CAMBIO, 2 INTERVALO, 3 MANUAL
-  uint16_t intervalo;       // para INTERVALO o fixed-point THRESH en CAMBIO
-  bool     enviarComoEntero;
-};
-
-// ======================= Instancias de IO =======================
-SwitchMCP*        switches[EEPROM_MAX_ENTRIES];
-PushButtonMCP*    buttons[EEPROM_MAX_ENTRIES];
-OutputManagerMCP* outputs[EEPROM_MAX_ENTRIES];
-
-IOPin* switchPins[EEPROM_MAX_ENTRIES];
-IOPin* buttonPins[EEPROM_MAX_ENTRIES];
-IOPin* outputPins[EEPROM_MAX_ENTRIES];
-
-const char* switchParams[EEPROM_MAX_ENTRIES];
-const char* buttonParams[EEPROM_MAX_ENTRIES];
-const char* outputParams[EEPROM_MAX_ENTRIES];
-const char* potParams[EEPROM_MAX_ENTRIES];
-
-int switchCount = 0, buttonCount = 0, potCount = 0, outputCount = 0;
 
 // ======================= SELECTORS (como POT: múltiples filas agrupadas) =======================
 // ControllerMCP.h ya trae SelectorMCP; aquí solo mantenemos el runtime.
@@ -797,6 +918,7 @@ void loadConfigFromEEPROM() {
         char val1[12], val2[12];
         dtostrf(cfg.minOut, 1, 3, val1);
         dtostrf(cfg.maxOut, 1, 3, val2);
+        switchPinNum[switchCount] = cfg.pin;
         switchParams[switchCount] = copy;
         switchPins[switchCount]   = pin;
         switches[switchCount]     = new SwitchMCP(pin, strdup(copy), strdup(val1), strdup(val2));
@@ -810,6 +932,7 @@ void loadConfigFromEEPROM() {
         char val1[12], val2[12];
         dtostrf(cfg.minOut, 1, 3, val1);
         dtostrf(cfg.maxOut, 1, 3, val2);
+        buttonPinNum[buttonCount] = cfg.pin;
         buttonParams[buttonCount] = copy;
         buttonPins[buttonCount]   = pin;
         buttons[buttonCount]      = new PushButtonMCP(pin, strdup(copy), strdup(val1), strdup(val2));
@@ -820,6 +943,7 @@ void loadConfigFromEEPROM() {
 
       case 2: { // OUTPUT
         if (!pin) { free(copy); break; }
+        outputPinNum[outputCount] = cfg.pin;
         outputParams[outputCount] = copy;
         outputPins[outputCount]   = pin;
         outputs[outputCount]      = new OutputManagerMCP(copy, pin);
@@ -956,11 +1080,11 @@ void savePinConfig(const String& tipo, int pin, const char* param, const char* v
       cfg.maxIn = 32767;
     } else {
       cfg.minIn = 0;
-#if defined(ESP32)
-      cfg.maxIn = 4095;
-#else
-      cfg.maxIn = 1023;
-#endif
+      #if defined(ESP32)
+        cfg.maxIn = 4095;
+      #else
+        cfg.maxIn = 1023;
+      #endif
     }
     cfg.suavizado        = 0.10f;
     cfg.modoEnvio        = 0;    // CONTINUO
@@ -1008,7 +1132,7 @@ static bool notchSaveAllToEEPROM() {
     bool hasC   = potNotchHasCenters[i];
 
     size_t recSize = 1 + 1 + sizeof(float) + 1 + 1 +
-                     (cnt*sizeof(uint16_t)) + (cnt*sizeof(float)) +
+                    (cnt*sizeof(uint16_t)) + (cnt*sizeof(float)) +
                      sizeof(float); // snapWin
     if (off + recSize > NOTCH_REGION_BASE + NOTCH_REGION_SIZE) {
       enviar(F("❌ NOTCH SAVEALL: sin espacio."));
@@ -1156,7 +1280,6 @@ static void notchLoadAllFromEEPROM() {
       potEmaRaw[idx]    = NAN;
     }
   }
-
   enviar(String("📥 NOTCH LOADALL: ") + numRecs + " registros cargados.");
 }
 
@@ -1232,7 +1355,7 @@ void updatePotParam(String cmd) {
         EE::commit();
 
         enviar(String("THRESH OK en ") + pinToStringForDump(cfg.pin, cfg.type) +
-               " = " + String(th, 4));
+              " = " + String(th, 4));
         return;
       }
       else {
@@ -1272,8 +1395,8 @@ static void modbusInitWindowFromUsed() {
   }
   modbusSetEepromWindow(MB_REGION_BASE, MB_REGION_SIZE);
   enviar("MB.WINDOW base=" + String(MB_REGION_BASE) +
-         " size=" + String(MB_REGION_SIZE) +
-         " total=" + String(EE_SIZE_BYTES));
+        " size=" + String(MB_REGION_SIZE) +
+        " total=" + String(EE_SIZE_BYTES));
 }
 
 // ========= Networking =========
@@ -1284,8 +1407,8 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t /*info*/) {
     eth_connected = true;
     Serial.println("🌐 Ethernet conectado");
   } else if (event == ARDUINO_EVENT_ETH_DISCONNECTED ||
-             event == ARDUINO_EVENT_ETH_LOST_IP      ||
-             event == ARDUINO_EVENT_ETH_STOP) {
+            event == ARDUINO_EVENT_ETH_LOST_IP      ||
+            event == ARDUINO_EVENT_ETH_STOP) {
     eth_connected = false;
     Serial.println("📴 Ethernet desconectado");
   }
@@ -1821,9 +1944,9 @@ void handleLine(const char* command, const char* value) {
       }
 
       enviar(String("🗑️ Configuración eliminada del pin ") +
-             pinToStringForDump((uint8_t)pinToDelete, deletedCfg.type));
+            pinToStringForDump((uint8_t)pinToDelete, deletedCfg.type));
       enviar(String("DELETED_PIN ") +
-             pinToStringForDump((uint8_t)pinToDelete, deletedCfg.type));
+            pinToStringForDump((uint8_t)pinToDelete, deletedCfg.type));
 
       for (int i=0;i<switchCount;i++){
         if (switches[i]) { delete switches[i]; switches[i]=nullptr; }
@@ -2320,10 +2443,10 @@ void handleLine(const char* command, const char* value) {
     enviar(F("#END"));
 
     String resumen = String("{\"board\":\"") + getBoardType() + "\"," +
-                     "\"switches\":" + switchCount +
-                     ",\"buttons\":" + buttonCount +
-                     ",\"outputs\":" + outputCount +
-                     ",\"pots\":" + potCount + "}";
+                    "\"switches\":" + switchCount +
+                    ",\"buttons\":" + buttonCount +
+                    ",\"outputs\":" + outputCount +
+                    ",\"pots\":" + potCount + "}";
     enviar(resumen);
 
     // opcional, venía en el viejo
@@ -2465,45 +2588,59 @@ void handleLine(const char* command, const char* value) {
 
 // ========= AP / LED =========
 void enableAP() {
-  if (!apActive) {
+  if (apActive) return;
+
 #if defined(MODO_WIFI_AP)
-    WiFi.softAP("EASYSIMBigBoard");
-    IPAddress ip = WiFi.softAPIP();
-    Serial.print("🌐 AP activado: ");
-    Serial.println(ip);
+  // Fuerza modo AP (o AP+STA si quieres mantener compatibilidad)
+  WiFi.mode(WIFI_AP);          // <- clave
+  delay(100);
 
-    if (!wifiServerStarted) {
-      wifiServer.begin();
-      wifiServerStarted = true;
-      Serial.println("📥 WiFiServer (AP) escuchando en puerto 5000 (TCP)");
-    }
-#else
-    WiFi.softAP("EASYSIMBigBoard");
-    Serial.println("🌐 AP activado: 192.168.4.1");
-#endif
-    apActive = true;
-    setLed(0,255,0);
+  const char* ssid = "EASYSIMBigBoard";
+  const char* pass = nullptr;  // abierto (más fácil de ver)
+  int channel = 1;             // 1..13
+  bool hidden = false;
+  int maxConn = 1;
 
-#if defined(MODO_ETHERNET)
-    if (ethernetInterface) ethernetInterface->setUseEth(true);
-#endif
+  bool ok = WiFi.softAP(ssid, pass, channel, hidden, maxConn);
+  delay(200);
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("🌐 AP enable: ok=%d mode=%d ssid=%s ip=%s\n",
+                ok ? 1 : 0, (int)WiFi.getMode(), WiFi.softAPSSID().c_str(), ip.toString().c_str());
+
+  if (!wifiServerStarted) {
+    wifiServer.begin();
+    wifiServerStarted = true;
+    Serial.println("📥 WiFiServer (AP) escuchando en puerto 5000 (TCP)");
   }
+
+  apActive = ok;
+  if (apActive) setLed(0,255,0);
+#endif
 }
 
 void disableAP() {
-  if (apActive) {
-    WiFi.softAPdisconnect(true);
-    Serial.println("📴 AP desactivado");
-    apActive = false;
-    setLed(0,0,0);
-  }
+  if (!apActive) return;
+
+#if defined(MODO_WIFI_AP)
+  Serial.printf("📴 AP disable: stations=%d\n", WiFi.softAPgetStationNum());
+  WiFi.softAPdisconnect(true);
+  delay(100);
+
+  // Si quieres dejar WiFi totalmente apagado al salir:
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+#endif
+
+  apActive = false;
+  setLed(0,0,0);
 }
 
 // ======================= setup/loop =======================
 void setup() {
-#if defined(MODO_SERIAL)
-  Serial.begin(SERIAL_BAUD);
-#endif
+  #if defined(MODO_SERIAL)
+    Serial.begin(SERIAL_BAUD);
+  #endif
 
   EE::begin(16384);
   EE_ensureCountByte();
@@ -2541,18 +2678,17 @@ void setup() {
   I2CBUS1.begin(21, 14);
 
   scanBus(I2CBUS1, "OLED");
-  oledOK = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, false, false);
+  oledOK = true;  
+  display.begin();
+  display.setI2CAddress(0x3C << 1);
   Serial.printf("oledOK=%d\n", oledOK ? 1 : 0);
   if (oledOK) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0,0);
-    display.println("OLED OK");
-    display.println(getBoardType());   // <-- sin volver a setCursor(0,0)
-    display.display();
+    display.clearBuffer();
+    display.setFont(u8g2_font_5x8_tf);
+    display.drawStr(0, 10, "OLED OK");
+    display.drawStr(0, 20, "INICIANDO..");
+    display.sendBuffer();
   }
-
 
   // ADS1115
   g_ads_ok = g_ads.begin(0x48);
@@ -2651,21 +2787,25 @@ void setup() {
     uint32_t crc  = 0;
     if (mbLoadFromEEPROM(nDev, nTag, crc)) {
       enviar("✅ MB.AUTOLOAD dev=" + String(nDev) +
-             " tag=" + String(nTag) +
-             " crc=" + String((unsigned long)crc, 16));
+            " tag=" + String(nTag) +
+            " crc=" + String((unsigned long)crc, 16));
     } else {
       enviar("ℹ️ MB.AUTOLOAD: no hay paquete válido (aún). Usa MB.SAVE tras configurar.");
     }
   }
 
   // MCP por I2C
-  if (!busMCP.beginI2C({0x20, 0x21}, &Wire)) {
-    Serial.println("❌ Error al iniciar el bus MCP");
+  if (!busMCP.beginI2C_Auto8(&Wire)) {
+    Serial.println("❌ No se detectó ningún MCP23017 (0x20..0x27)");
+  } else {
+    Serial.printf("✅ MCP detectados: %d  mask=0b", busMCP.getDetectedChips());
+    Serial.println(busMCP.presentMask(), BIN);
   }
 
-#if defined(MODO_SERIAL)
-  serialInterface.begin();
-#endif
+
+  #if defined(MODO_SERIAL)
+    serialInterface.begin();
+  #endif
 
   // Cargar configuración y NOTCH (y selectors)
   loadConfigFromEEPROM();
@@ -2682,6 +2822,16 @@ void setup() {
   for (int i = 0; i < selectorCount; i++) {
     if (selectors[i]) selectors[i]->begin();
   }
+
+  Serial.println("TEST: levantando AP 5s...");
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP("EASYSIM_TEST");
+  Serial.printf("TEST softAP=%d IP=%s\n", ok ? 1 : 0, WiFi.softAPIP().toString().c_str());
+  Serial.printf("AP IP=%s  SSID=%s  mode=%d\n",
+  WiFi.softAPIP().toString().c_str(),
+  WiFi.softAPSSID().c_str(),
+  (int)WiFi.getMode()
+  );
 }
 
 void loop() {
@@ -2745,7 +2895,6 @@ void loop() {
 
   tickModbus();
 
-  // 4) IO (MCP) + POTS
   // 4) IO (MCP) + POTS
   if (!modoConfig && !bloqueado) {
 

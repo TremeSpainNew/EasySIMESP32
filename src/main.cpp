@@ -15,19 +15,25 @@
 #include <Adafruit_NeoPixel.h>
 #include <ctype.h>
 #include "nvs_flash.h"
-//#include <Menu.h>
-//#include <ElegantOTA.h>      // NUEVO: ElegantOTA para actualizaciones vía web
+//#include <io/Menu.h>
+#include <ElegantOTA.h>      // NUEVO: ElegantOTA para actualizaciones vía web
 #include <math.h>               // isnan, fabs, lroundf
 #include <Adafruit_ADS1X15.h>   // ADS1115
 #include <WiFiUdp.h>            // UDP para discover (usado dentro de ServerDiscovery normalmente)
 #include "EthernetInterface.h"  // interfaz TCP puerto 5000
 #include <ServerDiscovery.h>    // NUEVO: discover+cliente 5090 con callbacks
-//#include <Adafruit_GFX.h>
-//#include <Adafruit_SSD1306.h>
-//#include <Fonts/FreeSerif9pt7b.h>
-//#include <Adafruit_SH110X.h>
-#include <U8g2lib.h>
 
+//#include <PCF8574.h>
+
+#define SSD1306
+//#define SSD1309
+
+#if defined(SSD1306)
+  #include <Adafruit_GFX.h>
+  #include <Adafruit_SSD1306.h>
+#elif defined(SSD1309)
+  #include <U8g2lib.h>
+#endif
 
 // ---------------- Wrappers para la API nueva de EE ----------------
 template<typename T>
@@ -49,17 +55,18 @@ inline void EE_ensureCountByte() {
 bool bloqueaTCP = false;
 
 // ===================== LÍMITES/CONSTANTES EE =================
-static constexpr uint32_t EE_SIZE_BYTES = 16384; // total NVS simulada por EE
-
-// ======== Región NOTCH persistente (4 KB) ========
-static constexpr uint32_t NOTCH_REGION_SIZE = 4096;
-static constexpr uint32_t NOTCH_REGION_BASE = EE_SIZE_BYTES - NOTCH_REGION_SIZE;
-static constexpr uint32_t NOTCH_MAGIC = 0x4E544348; // 'N''T''C''H'
-static constexpr uint8_t  NOTCH_VERSION = 3;        // V3: partial+snapwin
+static constexpr uint32_t EE_SIZE_BYTES = 24576; // 24 KB // total NVS simulada por EE
 
 // ======== Ventana Modbus (8 KB) al final ========
 static constexpr uint32_t MB_REGION_SIZE = 8192; // 8 KB
 static constexpr uint32_t MB_REGION_BASE = EE_SIZE_BYTES - MB_REGION_SIZE;
+
+// ======== Región NOTCH persistente (4 KB) ========
+static constexpr uint32_t NOTCH_REGION_SIZE = 4096;
+static constexpr uint32_t NOTCH_REGION_BASE = EE_SIZE_BYTES - MB_REGION_SIZE - NOTCH_REGION_SIZE;
+
+static constexpr uint32_t NOTCH_MAGIC = 0x4E544348; // 'N''T''C''H'
+static constexpr uint8_t  NOTCH_VERSION = 5;        // V4: partial+snapwin
 
 // ========================= AP WiFI ===========================
 void handleLine(const char* command, const char* value);
@@ -81,8 +88,8 @@ MCPBusController busMCP;
 #define PIN_SDA 9
 #define PIN_SCL 8
 // I2C Bus Oled
-#define OLED_SDA 21
-#define OLED_SCL 14
+#define OLED_SDA 14
+#define OLED_SCL 21
 
 TwoWire I2CBUS1 = TwoWire(1); // para OLED
 
@@ -170,6 +177,19 @@ uint8_t switchPinNum[EEPROM_MAX_ENTRIES];
 uint8_t buttonPinNum[EEPROM_MAX_ENTRIES];
 uint8_t outputPinNum[EEPROM_MAX_ENTRIES];
 
+bool ioWatchEnabled = false;
+uint8_t ioWatchPin = 0;
+char ioWatchKind[16] = "";
+int ioWatchLastValue = -9999;
+unsigned long ioWatchLastMs = 0;
+
+static int lastSwitchState[EEPROM_MAX_ENTRIES];
+static int lastButtonState[EEPROM_MAX_ENTRIES];
+static int lastOutputState[EEPROM_MAX_ENTRIES];
+static int lastPotState[EEPROM_MAX_ENTRIES];
+
+static unsigned long lastIoStateMs = 0;
+
 int switchCount = 0, buttonCount = 0, potCount = 0, outputCount = 0;
 
 // ======================= AP/LED (MOVIDO ARRIBA para oledDrawStatus) =======================
@@ -190,21 +210,28 @@ static unsigned long apPressStart    = 0;
 
 bool apActive = false;
 unsigned long buttonPressStart = 0;
-const unsigned long longPressTime = 2000;
+const unsigned long longPressTime = 1000;
 
 // ======================= Cliente TCP a servidor principal (5090) (MOVIDO ARRIBA para oledDrawStatus) =======================
 static const uint16_t kClientServerPort = 5090;
 ServerDiscovery serverDiscovery(5091,5090); // la clase hace discover UDP+TCP 5090
 
 // ======================= OLED SSD1306 =======================
-#define OLED_ADDR   0x78
+#define OLED_ADDR   0x3C
 #define OLED_W      128
 #define OLED_H      64
 #define OLED_RESET  -1   // sin pin reset
 
-//Adafruit_SSD1306 display(OLED_W, OLED_H, &I2CBUS1, OLED_RESET);
-U8G2_SSD1309_128X64_NONAME2_F_SW_I2C display(U8G2_R0, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA, /* reset=*/ U8X8_PIN_NONE);
+#if defined(SSD1306)
+  Adafruit_SSD1306 display(OLED_W, OLED_H, &I2CBUS1, OLED_RESET);
+#elif defined(SSD1309)
+  U8G2_SSD1309_128X64_NONAME2_F_SW_I2C display(U8G2_R0, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA, /* reset=*/ U8X8_PIN_NONE);
+#endif
+//U8G2_SSD1306_128X64_NONAME_F_SW_I2C display(U8G2_R0, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA, /* reset=*/ U8X8_PIN_NONE);
+//U8G2_SSD1309_128X64_NONAME2_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 //Adafruit_SH1106G display(128, 64, &Wire, -1);
+//Menu menu(display);
+//PCF8574 pcf(0x38); // para el menú
 
 static bool oledOK = false;
 static unsigned long lastOledMs = 0;
@@ -320,7 +347,30 @@ static int buildIoItems(IoItem* out, int maxItems) {
 
   return n;
 }
+#if defined(SSD1306)
+static void oledDrawNetPage_Adafruit(const String& frame) {
+  if (!oledOK) return;
 
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  int start = 0;
+  int lines = 0;
+  while (start < (int)frame.length() && lines < 8) { // 8 líneas aprox en 64px
+    int nl = frame.indexOf('\n', start);
+    String line = (nl >= 0) ? frame.substring(start, nl) : frame.substring(start);
+    display.println(line);
+    lines++;
+    if (nl < 0) break;
+    start = nl + 1;
+  }
+
+  display.display();
+}
+#endif
+#if defined(SSD1309)
 static void oledDrawIOPage() {
   if (!oledOK) return;
 
@@ -388,6 +438,7 @@ static void oledDrawIOPage() {
   }
   display.sendBuffer();
 }
+#endif
 
 static String buildOledFrame() {
   bool linkUp = ETH.linkUp();
@@ -399,7 +450,7 @@ static String buildOledFrame() {
   else if (!hasIp)  mode = "NO IP";
   else              mode = (ethStaticFallbackUsed ? "STATIC" : "DHCP");
 
-  bool cliUp = serverDiscovery.connected();
+  bool cliUp  = linkUp && serverDiscovery.connected();   // ✅ AQUÍ
   bool hasSrv = serverDiscovery.hasServerIp();
   IPAddress srvIp = serverDiscovery.serverIp();
 
@@ -435,47 +486,7 @@ static void scanBus(TwoWire &bus, const char* name) {
   if (!found) Serial.println("❌ No se encontraron dispositivos en este bus.");
 }
 
-/*static void oledMaybeDrawChangeOnly() {
-  if (!oledOK) return;
-
-  const unsigned long now = millis();
-  if (now - lastOledDraw < OLED_MIN_MS) return;
-
-  String frame = buildOledFrame();
-  const bool changed   = (frame != oledLastFrame);
-  const bool keepalive = (now - lastOledDraw) >= OLED_KEEPALIVE_MS;
-
-  if (!changed && !keepalive) return;
-
-  oledLastFrame = frame;
-  lastOledDraw  = now;
-
-  // ---- DIBUJO ----
-  display.clearBuffer ();
-  display.setCursor(0,0);
-
-  int start = 0;
-  int y = 0;
-
-  while (start < frame.length()) {
-    int nl = frame.indexOf('\n', start);
-    String line = (nl >= 0)
-                    ? frame.substring(start, nl)
-                    : frame.substring(start);
-
-    display.setCursor(0, y);
-    display.print(line);
-
-    y += 8;                 // 8px por línea (font 5x7)
-    if (y > 56) break;      // evita salir del display
-
-    if (nl < 0) break;
-    start = nl + 1;
-  }
-
-  display.display();
-}*/
-
+#if defined(SSD1309)
 static void oledDrawNetPage_U8G2(const String& frame) {
   display.clearBuffer();
   display.setFont(u8g2_font_5x8_tf);
@@ -494,7 +505,7 @@ static void oledDrawNetPage_U8G2(const String& frame) {
 
   display.sendBuffer();
 }
-
+#endif
 static void oledMaybeDrawChangeOnly() {
   if (!oledOK) return;
 
@@ -502,7 +513,7 @@ static void oledMaybeDrawChangeOnly() {
   if (now - lastOledDraw < OLED_MIN_MS) return;
 
   if (oledPage == OLED_PAGE_IO) {
-    oledDrawIOPage();           // <-- tu página de círculos
+    //oledDrawIOPage();           // <-- tu página de círculos
     lastOledDraw = now;
     return;
   }
@@ -515,7 +526,12 @@ static void oledMaybeDrawChangeOnly() {
   oledLastFrame = frame;
   lastOledDraw  = now;
 
-  oledDrawNetPage_U8G2(frame);
+  #if defined(SSD1306)
+    oledDrawNetPage_Adafruit(frame);
+  #elif defined(SSD1309)  
+    oledDrawNetPage_U8G2(frame);
+  #endif
+  //oledDrawNetPage_Adafruit(frame);
 }
 
 
@@ -625,6 +641,75 @@ static float    potEmaRaw[EEPROM_MAX_ENTRIES];
 // --- Híbrido NOTCH+Lineal ---
 static bool  potPartial[EEPROM_MAX_ENTRIES]; // OFF por defecto
 static float potSnapWin[EEPROM_MAX_ENTRIES]; // fracción del rango crudo
+
+// ✅ NUEVO: HYBRIDSEG (lineal solo entre 2 muescas internas)
+static bool    potHybridSegEn[EEPROM_MAX_ENTRIES];   // ON/OFF
+static uint8_t potHybridSegA[EEPROM_MAX_ENTRIES];    // índice notch A (0-based)
+static uint8_t potHybridSegB[EEPROM_MAX_ENTRIES];    // índice notch B (0-based)
+
+// ===================== POT SPLIT (persistente en NOTCH v4) =====================
+enum PotSplitMode : uint8_t {
+  SPLIT_OFF = 0,
+  SPLIT_DUAL = 1,           // tagFwd + tagBack
+  SPLIT_SINGLE_SIGNED = 2,  // tagSingle = -..+
+  SPLIT_SINGLE_CENTERED = 3 // tagSingle = 0..(2*center)
+};
+
+enum NotchChan : uint8_t {
+  NCH_BASE   = 0, // canal único (sin split)
+  NCH_FWD    = 1, // split dual forward
+  NCH_BACK   = 2, // split dual back
+  NCH_SINGLE = 3  // split single (signed/centered)
+};
+
+static inline const char* notchChanToStr(NotchChan ch){
+  switch(ch){
+    case NCH_BASE:   return "BASE";
+    case NCH_FWD:    return "FWD";
+    case NCH_BACK:   return "BACK";
+    case NCH_SINGLE: return "SINGLE";
+    default:         return "BASE";
+  }
+}
+
+static bool parseNotchChanToken(const String& tok, NotchChan &out){
+  String t = tok; t.trim(); t.toUpperCase();
+  if (t=="BASE")   { out=NCH_BASE; return true; }
+  if (t=="FWD")    { out=NCH_FWD; return true; }
+  if (t=="BACK")   { out=NCH_BACK; return true; }
+  if (t=="SINGLE") { out=NCH_SINGLE; return true; }
+  return false;
+}
+
+static PotSplitMode potSplitMode[EEPROM_MAX_ENTRIES];
+static float potSplitDeadband[EEPROM_MAX_ENTRIES];   // fracción 0..0.3 del rango raw
+static float potSplitCenterBias[EEPROM_MAX_ENTRIES]; // 0..1 (0.5 típico)
+
+static char* potTagFwd[EEPROM_MAX_ENTRIES];     // throttle (adelante)
+static char* potTagBack[EEPROM_MAX_ENTRIES];    // brake (atrás)
+static char* potTagSingle[EEPROM_MAX_ENTRIES];  // palanca única
+
+static void potSplitResetRAM(int i){
+  potSplitMode[i] = SPLIT_OFF;
+  potSplitDeadband[i] = 0.02f;     // 2% por defecto
+  potSplitCenterBias[i] = 0.5f;    // centro por defecto
+  if (potTagFwd[i])    { free(potTagFwd[i]); potTagFwd[i]=nullptr; }
+  if (potTagBack[i])   { free(potTagBack[i]); potTagBack[i]=nullptr; }
+  if (potTagSingle[i]) { free(potTagSingle[i]); potTagSingle[i]=nullptr; }
+}
+
+// Helpers numéricos SPLIT
+static inline float norm01_from_raw(int raw, int rmin, int rmax){
+  if (rmax == rmin) return 0.0f;
+  float n = (float)(raw - rmin) / (float)(rmax - rmin);
+  if (n < 0) n = 0;
+  if (n > 1) n = 1;
+  return n;
+}
+static inline bool potSplitEnabled(int i){
+  return potSplitMode[i] != SPLIT_OFF;
+}
+
 
 // ADS1115
 Adafruit_ADS1115 g_ads;
@@ -863,6 +948,28 @@ static void dumpSelectorsAsSEL_ADD() {
     String name = String(cfg.param);
     int16_t v = (int16_t)lroundf(cfg.minOut);
     enviar(String("SEL.ADD ") + name + " " + String((int)cfg.pin) + " " + String((int)v));
+  }
+}
+
+static void sortNotchCentersAndVals(int idx) {
+  if (idx < 0) return;
+  uint8_t n = potNotchCount[idx];
+  if (n < 2) return;
+  if (!potNotchHasCenters[idx]) return;
+
+  // Ordena por centro RAW ascendente, arrastrando el valor asociado
+  for (uint8_t i = 0; i < n - 1; i++) {
+    for (uint8_t j = i + 1; j < n; j++) {
+      if (potNotchCenterRaw[idx][j] < potNotchCenterRaw[idx][i]) {
+        uint16_t tc = potNotchCenterRaw[idx][i];
+        potNotchCenterRaw[idx][i] = potNotchCenterRaw[idx][j];
+        potNotchCenterRaw[idx][j] = tc;
+
+        float tv = potNotchVals[idx][i];
+        potNotchVals[idx][i] = potNotchVals[idx][j];
+        potNotchVals[idx][j] = tv;
+      }
+    }
   }
 }
 
@@ -1107,6 +1214,30 @@ static void notchEraseRegion() {
   EE::commit();
 }
 
+// ===== Helpers EEPROM para NOTCH v4 (strings compactas) =====
+static void eeWriteStr(uint32_t &off, const char* s, uint8_t maxLen=63){
+  uint8_t len = 0;
+  if (s) len = (uint8_t)strnlen(s, maxLen);
+  EE::write(off++, len);
+  for (uint8_t i=0;i<len;i++) EE::write(off++, (uint8_t)s[i]);
+}
+
+static void eeReadStr(uint32_t &off, char* &dst, uint32_t regionEnd){
+  uint8_t len = 0;
+  if (off >= regionEnd) { dst=nullptr; return; }
+  len = EE::read(off++);
+  if (dst) { free(dst); dst=nullptr; }
+  if (!len) return;
+  if (off + len > regionEnd) { return; }
+  dst = (char*)malloc(len+1);
+  for (uint8_t i=0;i<len;i++) dst[i] = (char)EE::read(off++);
+  dst[len] = 0;
+}
+
+static inline size_t eeStrSize(const char* s){
+  return 1 + (s ? strnlen(s, 63) : 0);
+}
+
 static bool notchSaveAllToEEPROM() {
   uint32_t off = NOTCH_REGION_BASE;
 
@@ -1127,17 +1258,38 @@ static bool notchSaveAllToEEPROM() {
 
   for (int i = 0; i < potCount; i++) {
     uint8_t cnt = potNotchCount[i];
-    if (cnt == 0) continue;
     uint8_t pin = potCfgs[i].pin;
     bool hasC   = potNotchHasCenters[i];
 
-    size_t recSize = 1 + 1 + sizeof(float) + 1 + 1 +
-                    (cnt*sizeof(uint16_t)) + (cnt*sizeof(float)) +
-                     sizeof(float); // snapWin
-    if (off + recSize > NOTCH_REGION_BASE + NOTCH_REGION_SIZE) {
-      enviar(F("❌ NOTCH SAVEALL: sin espacio."));
-      return false;
+    // ✅ Guardar también si hay SPLIT/tags aunque no haya NOTCH
+    const bool hasAnySplitTag =
+      (potTagSingle[i] && potTagSingle[i][0]) ||
+      (potTagFwd[i]    && potTagFwd[i][0])    ||
+      (potTagBack[i]   && potTagBack[i][0]);
+
+    const bool hasSplit = (potSplitMode[i] != SPLIT_OFF) || hasAnySplitTag;
+
+    // ✅ HYBRIDSEG cuenta como “extras que merecen guardado”
+    const bool hasHybrid = potHybridSegEn[i];
+
+    // Si cnt==0 y no hay split ni extras que merezcan guardado, saltar
+    if (cnt == 0 && !hasSplit && !potPartial[i] && !hasHybrid) {
+      // (si también quieres que snapWin se guarde siempre, quita este if)
+      continue;
     }
+
+    // ---- v4 añade SPLIT: mode + deadband + centerBias + 3 strings ----
+    size_t splitSize = 1 + sizeof(float) + sizeof(float)
+                     + eeStrSize(potTagSingle[i])
+                     + eeStrSize(potTagFwd[i])
+                     + eeStrSize(potTagBack[i]);
+
+    size_t recSize = 1 + 1 + sizeof(float) + 1 + 1 +
+                 (cnt*sizeof(uint16_t)) + (cnt*sizeof(float)) +
+                 sizeof(float) + // snapWin
+                 splitSize +
+                 3;              // ✅ HYBRIDSEG: en + a + b
+    (void)recSize; // por si no lo usas para checks
 
     EE::write(off, pin); off += 1;
     EE::write(off, cnt); off += 1;
@@ -1150,19 +1302,37 @@ static bool notchSaveAllToEEPROM() {
     EE::write(off, flags); off += 1;
     EE::write(off, 0);     off += 1; // reservado
 
+    // centros (si cnt==0, no entra)
     for (uint8_t k=0;k<cnt;k++){
       uint16_t c = hasC ? potNotchCenterRaw[i][k] : 0;
       EE_PUT(off, c);
       off += sizeof(uint16_t);
     }
 
+    // vals (si cnt==0, no entra)
     for (uint8_t k=0;k<cnt;k++){
       EE_PUT(off, potNotchVals[i][k]);
       off += sizeof(float);
     }
 
+    // snapWin se guarda siempre si el registro existe
     EE_PUT(off, potSnapWin[i]);
     off += sizeof(float);
+
+    // ---- SPLIT v4 ----
+    EE::write(off, (uint8_t)potSplitMode[i]); off += 1;
+    EE_PUT(off, potSplitDeadband[i]);         off += sizeof(float);
+    EE_PUT(off, potSplitCenterBias[i]);       off += sizeof(float);
+
+    // orden fijo: single, fwd, back
+    eeWriteStr(off, potTagSingle[i], 63);
+    eeWriteStr(off, potTagFwd[i], 63);
+    eeWriteStr(off, potTagBack[i], 63);
+
+    // ✅ v5: HYBRIDSEG (en + a + b)
+    EE::write(off++, potHybridSegEn[i] ? 1 : 0);
+    EE::write(off++, potHybridSegA[i]);
+    EE::write(off++, potHybridSegB[i]);
 
     numRecs++;
   }
@@ -1173,6 +1343,7 @@ static bool notchSaveAllToEEPROM() {
   enviar(String("💾 NOTCH SAVEALL: ") + numRecs + " registros.");
   return true;
 }
+
 
 static void notchLoadAllFromEEPROM() {
   uint32_t off = NOTCH_REGION_BASE;
@@ -1188,6 +1359,7 @@ static void notchLoadAllFromEEPROM() {
   uint8_t ver = EE::read(off);
   off += 1;
 
+  // reservado (3 bytes)
   off += 3;
 
   uint16_t numRecs = 0;
@@ -1205,6 +1377,14 @@ static void notchLoadAllFromEEPROM() {
     potNotchHasCenters[i] = false;
     potPartial[i]         = false;
     potSnapWin[i]         = 0.03f;
+
+    // ✅ HYBRIDSEG reset
+    potHybridSegEn[i] = false;
+    potHybridSegA[i]  = 0;
+    potHybridSegB[i]  = 0;
+
+    // ✅ SPLIT reset
+    potSplitResetRAM(i);
   }
 
   for (uint16_t r = 0; r < numRecs; r++) {
@@ -1217,24 +1397,39 @@ static void notchLoadAllFromEEPROM() {
     EE_GET(off, hyst);
     off += sizeof(float);
 
-    bool    hasC    = false;
-    bool    partial = false;
-    float   snap    = 0.03f;
+    bool  hasC    = false;
+    bool  partial = false;
+    float snap    = 0.03f;
+
+    // ---- SPLIT v4 defaults ----
+    PotSplitMode sm = SPLIT_OFF;
+    float db = 0.02f;
+    float cb = 0.5f;
+    char* sSingle = nullptr;
+    char* sFwd    = nullptr;
+    char* sBack   = nullptr;
+
+    // ✅ HYBRIDSEG v5 defaults
+    bool    hsegEn = false;
+    uint8_t hsegA  = 0;
+    uint8_t hsegB  = 0;
 
     uint32_t centersPos = 0;
     uint32_t valsPos    = 0;
 
     if (ver >= 2) {
       uint8_t flags = EE::read(off); off += 1;
-      off += 1;
+      off += 1; // reservado
 
       hasC    = (flags & 0x01) != 0;
       partial = (flags & 0x02) != 0;
 
       centersPos = off;
+      if (off + cnt * sizeof(uint16_t) > regionEnd) break;
       off += cnt * sizeof(uint16_t);
 
       valsPos = off;
+      if (off + cnt * sizeof(float) > regionEnd) break;
       off += cnt * sizeof(float);
 
       if (ver >= 3) {
@@ -1242,44 +1437,111 @@ static void notchLoadAllFromEEPROM() {
         EE_GET(off, snap);
         off += sizeof(float);
       }
+
+      // ✅ v4: SPLIT (mode + deadband + centerBias + strings)
+      if (ver >= 4) {
+        if (off + 1 + sizeof(float) + sizeof(float) > regionEnd) break;
+
+        sm = (PotSplitMode)EE::read(off); off += 1;
+        EE_GET(off, db);                 off += sizeof(float);
+        EE_GET(off, cb);                 off += sizeof(float);
+
+        eeReadStr(off, sSingle, regionEnd);
+        eeReadStr(off, sFwd,    regionEnd);
+        eeReadStr(off, sBack,   regionEnd);
+
+        // ✅ v5: HYBRIDSEG (en + a + b) después de las 3 strings
+        if (ver >= 5) {
+          if (off + 3 > regionEnd) break;
+          hsegEn = (EE::read(off++) != 0);
+          hsegA  = EE::read(off++);
+          hsegB  = EE::read(off++);
+        }
+      }
+
     } else {
+      // v1: solo vals
       centersPos = 0;
       valsPos    = off;
+      if (off + cnt * sizeof(float) > regionEnd) break;
       off += cnt * sizeof(float);
       hasC       = false;
       partial    = false;
       snap       = 0.03f;
+      // (no split ni hybrid en v1)
     }
 
     int idx = getPotIndexByPin(pin);
-    if (idx >= 0 && cnt > 0) {
-      if (cnt > MAX_NOTCHES) cnt = MAX_NOTCHES;
+    if (idx >= 0) {
+      // Si cnt > 0 cargamos NOTCH, si cnt==0 dejamos notchCount=0 pero aplicamos flags/split/hybrid igualmente
+      uint8_t cntClamped = cnt;
+      if (cntClamped > MAX_NOTCHES) cntClamped = MAX_NOTCHES;
 
-      potNotchCount[idx]      = cnt;
       potNotchHystPct[idx]    = hyst;
-      potNotchHasCenters[idx] = (ver >= 2) ? hasC : false;
       potPartial[idx]         = (ver >= 3) ? partial : false;
       potSnapWin[idx]         = (ver >= 3) ? snap : 0.03f;
 
-      if (ver >= 2) {
-        for (uint8_t k = 0; k < cnt; k++) {
-          uint16_t c = 0;
-          EE_GET(centersPos + k * sizeof(uint16_t), c);
-          potNotchCenterRaw[idx][k] = c;
-        }
-      }
+      if (cntClamped > 0) {
+        potNotchCount[idx]      = cntClamped;
+        potNotchHasCenters[idx] = (ver >= 2) ? hasC : false;
 
-      for (uint8_t k = 0; k < cnt; k++) {
-        float v = 0.0f;
-        EE_GET(valsPos + k * sizeof(float), v);
-        potNotchVals[idx][k] = v;
+        if (ver >= 2 && hasC) {
+          for (uint8_t k = 0; k < cntClamped; k++) {
+            uint16_t c = 0;
+            EE_GET(centersPos + k * sizeof(uint16_t), c);
+            potNotchCenterRaw[idx][k] = c;
+          }
+          potNotchHasCenters[idx] = true;
+        } else {
+          potNotchHasCenters[idx] = false;
+        }
+
+        for (uint8_t k = 0; k < cntClamped; k++) {
+          float v = 0.0f;
+          EE_GET(valsPos + k * sizeof(float), v);
+          potNotchVals[idx][k] = v;
+        }
+      } else {
+        potNotchCount[idx] = 0;
+        potNotchHasCenters[idx] = false;
       }
 
       potLastNotch[idx] = -1;
       potEmaNorm[idx]   = NAN;
       potEmaRaw[idx]    = NAN;
+
+      // ✅ aplicar SPLIT v4 también cuando cnt==0
+      if (ver >= 4) {
+        potSplitMode[idx]       = sm;
+        potSplitDeadband[idx]   = db;
+        potSplitCenterBias[idx] = cb;
+
+        if (potTagSingle[idx]) { free(potTagSingle[idx]); potTagSingle[idx] = nullptr; }
+        if (potTagFwd[idx])    { free(potTagFwd[idx]);    potTagFwd[idx]    = nullptr; }
+        if (potTagBack[idx])   { free(potTagBack[idx]);   potTagBack[idx]   = nullptr; }
+
+        potTagSingle[idx] = sSingle; sSingle = nullptr;
+        potTagFwd[idx]    = sFwd;    sFwd    = nullptr;
+        potTagBack[idx]   = sBack;   sBack   = nullptr;
+      }
+
+      // ✅ aplicar HYBRIDSEG v5 también cuando cnt==0
+      if (ver >= 5) {
+        potHybridSegEn[idx] = hsegEn;
+        potHybridSegA[idx]  = hsegA;
+        potHybridSegB[idx]  = hsegB;
+      }
+
+      // ✅ IMPORTANTÍSIMO: normaliza el orden por centro (solo si idx válido)
+      sortNotchCentersAndVals(idx);
     }
+
+    // Limpieza si no se asignaron (por ejemplo pin no existe)
+    if (sSingle) { free(sSingle); sSingle = nullptr; }
+    if (sFwd)    { free(sFwd);    sFwd    = nullptr; }
+    if (sBack)   { free(sBack);   sBack   = nullptr; }
   }
+
   enviar(String("📥 NOTCH LOADALL: ") + numRecs + " registros cargados.");
 }
 
@@ -1297,9 +1559,13 @@ static bool notchDeleteFromEEPROM(uint8_t pin) {
     potNotchHasCenters[idx] = false;
     potPartial[idx]         = false;
     potSnapWin[idx]         = 0.03f;
+
+    // ✅ SPLIT reset también al borrar notch del pin
+    potSplitResetRAM(idx);
   }
   return notchSaveAllToEEPROM();
 }
+
 
 // ==================== updatePotParam ====================
 void updatePotParam(String cmd) {
@@ -1385,6 +1651,42 @@ static void nvsWipeAllAndReboot() {
   ESP.restart();
 }
 
+int readIoLiveValue(uint8_t pin, const char* kind) {
+  if (strcasecmp(kind, "BUTTON") == 0 ||
+      strcasecmp(kind, "SWITCH") == 0 ||
+      strcasecmp(kind, "SELECTOR") == 0) {
+
+    IOPin* p = busMCP.getPin(pin, true);
+    if (!p) return 0;
+
+    p->pinMode(INPUT_PULLUP);
+    return (p->digitalRead() == LOW) ? 1 : 0;
+  }
+
+  if (strcasecmp(kind, "OUTPUT") == 0) {
+    IOPin* p = busMCP.getPin(pin, false);
+    if (!p) return 0;
+
+    return p->digitalRead() == HIGH ? 1 : 0;
+  }
+
+  if (strcasecmp(kind, "POT") == 0) {
+    if (isADSIndex(pin)) {
+      uint8_t ch = adsChannel(pin);
+      if (!g_ads_ok || ch > 3) return 0;
+
+      if (adsCacheOk[ch]) return adsRawCache[ch];
+
+      int16_t r = g_ads.readADC_SingleEnded(ch);
+      return r < 0 ? 0 : (int)r;
+    }
+
+    return analogRead(pin);
+  }
+
+  return 0;
+}
+
 // ========= Ventana Modbus con EE =========
 static void modbusInitWindowFromUsed() {
   uint8_t count = EE::read(0);
@@ -1421,33 +1723,46 @@ static inline float mapf(float x, float in_min, float in_max, float out_min, flo
 }
 
 // ===================== Lectura/envío de POTs =====================
-// (SIN CAMBIOS: tu tickPots completo)
+// ✅ tickPots() COMPLETO (corregido: SPLIT sin SPLIT_UNIPOLAR, y con “last” por tag)
+// - ADS lee desde cache (adsPollCache())
+// - NOTCH + PARTIAL + SNAPWIN igual que lo tenías
+// - SPLIT:
+//    * DUAL: tagFwd / tagBack (y opcional tagSingle para zona muerta)
+//    * SIGNED: un solo tag (-..+)
+//    * CENTERED: un solo tag (0..2 con centro=1)
+// - THRESH se aplica por “canal/tag” para que al cambiar de lado no se pierdan envíos
 void tickPots() {
   const unsigned long now = millis();
+
+  // “Last” independientes para SPLIT (por POT i)
+  static float lastFwd[EEPROM_MAX_ENTRIES];
+  static float lastBack[EEPROM_MAX_ENTRIES];
+  static float lastSingle[EEPROM_MAX_ENTRIES];
+  static bool  lastInit[EEPROM_MAX_ENTRIES] = {false};
+
+  // EMA opcional SOLO para split (por POT i)
+  static float splitEMA[EEPROM_MAX_ENTRIES];
+  static bool  splitEMAInit[EEPROM_MAX_ENTRIES] = {false};
 
   for (int i = 0; i < potCount; i++) {
     const PinConfig &cfg = potCfgs[i];
     int raw = 0;
 
     // =======================
-    // 1) LECTURA RAW (SIN I2C directo)  ✅
+    // 1) LECTURA RAW (sin I2C directo) ✅
     // =======================
     if (isADSIndex(cfg.pin)) {
       if (!g_ads_ok) continue;
       uint8_t ch = adsChannel(cfg.pin);
       if (ch > 3) continue;
-    
-      // ✅ leer del cache (ya refrescado en adsPollCache())
-      if (!adsCacheOk[ch]) continue;
+      if (!adsCacheOk[ch]) continue;      // cache no listo
       raw = adsRawCache[ch];
-    
     } else {
       raw = analogRead(cfg.pin);
     }
 
-
     // =======================
-    // 2) MAP + EMA
+    // 2) MAP + EMA (SCALE)
     // =======================
     float val = mapf((float)raw, (float)cfg.minIn, (float)cfg.maxIn, cfg.minOut, cfg.maxOut);
     if (val < cfg.minOut) val = cfg.minOut;
@@ -1471,14 +1786,16 @@ void tickPots() {
         debeEnviar = true;
         break;
 
-      case 1: { // CAMBIO (+ NOTCH/HÍBRIDO universal)
+      case 1: { // CAMBIO  (+ NOTCH / SPLIT / HYBRIDSEG)
         const bool hasNotches = (potNotchCount[i] > 0);
 
+        // ============================================================
+        // A) NOTCH / HÍBRIDO (tu lógica, con HYBRIDSEG añadido)
+        // ============================================================
         if (hasNotches) {
-          // ====== con muescas (con o sin PARTIAL) ======
           float rawNow = (float)raw;
 
-          // Filtrado crudo para usar con centros / decisions
+          // Filtrado crudo para centros / decisions
           if (isnan(potEmaRaw[i])) potEmaRaw[i] = rawNow;
           else                     potEmaRaw[i] = (1.0f - cfg.suavizado) * potEmaRaw[i] + cfg.suavizado * rawNow;
 
@@ -1495,10 +1812,11 @@ void tickPots() {
                         potNotchHystPct[i]
                       );
           } else {
-            float norm = clamp01(
-              (float)(raw - potCfgs[i].minIn) /
-              (float)(potCfgs[i].maxIn - potCfgs[i].minIn)
-            );
+            float denom = (float)(potCfgs[i].maxIn - potCfgs[i].minIn);
+            if (denom == 0) denom = 1.0f;
+
+            float norm = clamp01(((float)raw - (float)potCfgs[i].minIn) / denom);
+
             if (isnan(potEmaNorm[i])) potEmaNorm[i] = norm;
             else                      potEmaNorm[i] = (1.0f - cfg.suavizado) * potEmaNorm[i] + cfg.suavizado * norm;
 
@@ -1533,9 +1851,7 @@ void tickPots() {
           } else {
             float minR = (float)potCfgs[i].minIn;
             float maxR = (float)potCfgs[i].maxIn;
-            float cell = (potNotchCount[i] > 0) ?
-                         (maxR - minR) / (float)potNotchCount[i] :
-                         (maxR - minR);
+            float cell = (potNotchCount[i] > 0) ? (maxR - minR) / (float)potNotchCount[i] : (maxR - minR);
             float center = minR + (nearIdx + 0.5f) * cell;
             near = (fabsf(rawForIdx - center) <= snapAbs);
           }
@@ -1562,30 +1878,47 @@ void tickPots() {
           float valMinNotch = potNotchVals[i][minIdx];
           float valMaxNotch = potNotchVals[i][maxIdx];
 
-          if (potPartial[i]) {
+          // ✅ HYBRIDSEG: segmento interno lineal entre A..B (índices de notch)
+          // - Prioridad: si HYBRIDSEG está activo y raw está entre centros A..B -> lineal entre vals[A]..vals[B]
+          // - Luego ya entra tu PARTIAL (colas) y por último el snap/notches
+          if (potHybridSegEn[i] && potNotchHasCenters[i] && potNotchCount[i] >= 2) {
+            uint8_t a = potHybridSegA[i];
+            uint8_t b = potHybridSegB[i];
+            if (a >= potNotchCount[i]) a = potNotchCount[i] - 1;
+            if (b >= potNotchCount[i]) b = potNotchCount[i] - 1;
+            if (a != b) {
+              float ca = (float)potNotchCenterRaw[i][a];
+              float cb = (float)potNotchCenterRaw[i][b];
+              float va = potNotchVals[i][a];
+              float vb = potNotchVals[i][b];
+
+              float loC = ca, hiC = cb, loV = va, hiV = vb;
+              if (hiC < loC) { float t=loC; loC=hiC; hiC=t; t=loV; loV=hiV; hiV=t; }
+
+              if (rawForIdx >= loC && rawForIdx <= hiC && (hiC - loC) > 0.0001f) {
+                float t = (rawForIdx - loC) / (hiC - loC);
+                t = clamp01(t);
+                outHybrid = mapf(t, 0.0f, 1.0f, loV, hiV);
+                useLinear = true; // ya tenemos salida lineal interna
+              }
+            }
+          }
+
+          // PARTIAL (colas) solo si no estamos usando el segmento híbrido interno
+          if (!useLinear && potPartial[i]) {
             if (rawForIdx < minCenterF) {
-              outHybrid = mapf(rawForIdx, minInF, minCenterF,
-                               cfg.minOut, valMinNotch);
+              outHybrid = mapf(rawForIdx, minInF, minCenterF, cfg.minOut, valMinNotch);
               useLinear = true;
             } else if (rawForIdx > maxCenterF) {
-              outHybrid = mapf(rawForIdx, maxCenterF, maxInF,
-                               valMaxNotch, cfg.maxOut);
+              outHybrid = mapf(rawForIdx, maxCenterF, maxInF, valMaxNotch, cfg.maxOut);
               useLinear = true;
             }
           }
 
           if (!useLinear) {
             int idxFinal = currIdx;
-            if (near && nearIdx >= 0 && nearIdx < potNotchCount[i]) {
-              idxFinal = nearIdx;
-            }
-
-            if (potLastNotch[i] < 0) {
-              potLastNotch[i] = idxFinal;
-            } else if (idxFinal != potLastNotch[i]) {
-              potLastNotch[i] = idxFinal;
-            }
-
+            if (near && nearIdx >= 0 && nearIdx < potNotchCount[i]) idxFinal = nearIdx;
+            potLastNotch[i] = (potLastNotch[i] < 0) ? idxFinal : idxFinal;
             outHybrid = potNotchVals[i][potLastNotch[i]];
           }
 
@@ -1594,11 +1927,8 @@ void tickPots() {
           float thr  = potThreshold[i];
           bool enviarAhora = false;
 
-          if (isnan(prev)) {
-            enviarAhora = true;
-          } else if (fabsf(outHybrid - prev) >= thr) {
-            enviarAhora = true;
-          }
+          if (isnan(prev)) enviarAhora = true;
+          else if (fabsf(outHybrid - prev) >= thr) enviarAhora = true;
 
           if (enviarAhora) {
             if (cfg.enviarComoEntero) {
@@ -1614,17 +1944,217 @@ void tickPots() {
           }
 
           debeEnviar = false;
+          break;
+        }
 
-        } else {
+        // ============================================================
+        // B) SIN NOTCH: SPLIT o CAMBIO normal
+        // ============================================================
+        if (!lastInit[i]) {
+          lastFwd[i] = NAN;
+          lastBack[i] = NAN;
+          lastSingle[i] = NAN;
+          lastInit[i] = true;
+        }
+
+        const PotSplitMode sm = potSplitMode[i];
+        const bool splitOn =
+          (sm != SPLIT_OFF) &&
+          (
+            (potTagSingle[i] && potTagSingle[i][0]) ||
+            (potTagFwd[i]    && potTagFwd[i][0])    ||
+            (potTagBack[i]   && potTagBack[i][0])
+          );
+
+        if (splitOn) {
+          // 1) normalizar raw a 0..1 con cfg.minIn/maxIn (crudo)
+          float denom = (float)(cfg.maxIn - cfg.minIn);
+          if (denom == 0.0f) denom = 1.0f;
+          float normRaw = ((float)raw - (float)cfg.minIn) / denom;
+          normRaw = clamp01(normRaw);
+
+          // 2) centro + deadband
+          float center = potSplitCenterBias[i];
+          if (center < 0.0f) center = 0.0f;
+          if (center > 1.0f) center = 1.0f;
+
+          float db = potSplitDeadband[i];
+          if (db < 0.0f) db = 0.0f;
+          if (db > 0.4f) db = 0.4f;
+
+          float lo = center - db;
+          float hi = center + db;
+          if (lo < 0.0f) lo = 0.0f;
+          if (hi > 1.0f) hi = 1.0f;
+
+          auto sendValueIfThresh = [&](const char* t, float x, float &lastRef) {
+            const float thr = potThreshold[i];
+            bool doSend = false;
+            if (isnan(lastRef)) doSend = true;
+            else if (fabsf(x - lastRef) >= thr) doSend = true;
+            if (!doSend) return;
+
+            if (cfg.enviarComoEntero) {
+              enviar(String(t) + "=" + String((int)lroundf(x)));
+            } else {
+              char f[24];
+              dtostrf(x, 0, 3, f);
+              char* p = f; while (*p==' ') ++p;
+              enviar(String(t) + "=" + String(p));
+            }
+            lastRef = x;
+            potLastMs[i] = now;
+          };
+
+          const bool inDead = (normRaw >= lo && normRaw <= hi);
+
+          if (sm == SPLIT_DUAL) {
+            if (inDead) {
+              // zona muerta: preferimos tagSingle si existe; si no, mandamos 0 a ambos
+              if (potTagSingle[i] && potTagSingle[i][0]) {
+                const char* tag = potTagSingle[i];
+                float outSend = mapf(0.0f, 0.0f, 1.0f, cfg.minOut, cfg.maxOut);
+
+                if (!splitEMAInit[i]) { splitEMA[i] = outSend; splitEMAInit[i] = true; }
+                else splitEMA[i] = (1.0f - cfg.suavizado) * splitEMA[i] + cfg.suavizado * outSend;
+                outSend = splitEMA[i];
+
+                sendValueIfThresh(tag, outSend, lastSingle[i]);
+              } else {
+                // parar ambos
+                const char* tf = (potTagFwd[i]  && potTagFwd[i][0])  ? potTagFwd[i]  : potParams[i];
+                const char* tb = (potTagBack[i] && potTagBack[i][0]) ? potTagBack[i] : potParams[i];
+                float z = mapf(0.0f, 0.0f, 1.0f, cfg.minOut, cfg.maxOut);
+
+                sendValueIfThresh(tf, z, lastFwd[i]);
+                sendValueIfThresh(tb, z, lastBack[i]);
+              }
+
+            } else if (normRaw > hi) {
+              // adelante
+              const char* tag = (potTagFwd[i] && potTagFwd[i][0]) ? potTagFwd[i] : potParams[i];
+
+              float t = (normRaw - hi) / (1.0f - hi);
+              t = clamp01(t);
+              float outSend = mapf(t, 0.0f, 1.0f, cfg.minOut, cfg.maxOut);
+
+              if (!splitEMAInit[i]) { splitEMA[i] = outSend; splitEMAInit[i] = true; }
+              else splitEMA[i] = (1.0f - cfg.suavizado) * splitEMA[i] + cfg.suavizado * outSend;
+              outSend = splitEMA[i];
+
+              sendValueIfThresh(tag, outSend, lastFwd[i]);
+
+              // opcional: “apaga” back cuando vas forward
+              if (potTagBack[i] && potTagBack[i][0]) {
+                float z = mapf(0.0f, 0.0f, 1.0f, cfg.minOut, cfg.maxOut);
+                sendValueIfThresh(potTagBack[i], z, lastBack[i]);
+              }
+
+            } else { // normRaw < lo
+              // atrás
+              const char* tag = (potTagBack[i] && potTagBack[i][0]) ? potTagBack[i] : potParams[i];
+
+              float t = (lo - normRaw) / (lo - 0.0f);
+              t = clamp01(t);
+              float outSend = mapf(t, 0.0f, 1.0f, cfg.minOut, cfg.maxOut);
+
+              if (!splitEMAInit[i]) { splitEMA[i] = outSend; splitEMAInit[i] = true; }
+              else splitEMA[i] = (1.0f - cfg.suavizado) * splitEMA[i] + cfg.suavizado * outSend;
+              outSend = splitEMA[i];
+
+              sendValueIfThresh(tag, outSend, lastBack[i]);
+
+              // opcional: “apaga” fwd cuando vas back
+              if (potTagFwd[i] && potTagFwd[i][0]) {
+                float z = mapf(0.0f, 0.0f, 1.0f, cfg.minOut, cfg.maxOut);
+                sendValueIfThresh(potTagFwd[i], z, lastFwd[i]);
+              }
+            }
+
+            debeEnviar = false;
+            break;
+          }
+
+          // ---- SINGLE SIGNED / CENTERED (usa potTagSingle o potParams) ----
+          const char* tag = (potTagSingle[i] && potTagSingle[i][0]) ? potTagSingle[i] : potParams[i];
+
+          float outSend = 0.0f;
+
+          if (sm == SPLIT_SINGLE_SIGNED) {
+            // signed in [-1..+1], deadband => 0
+            float signed01;
+            if (inDead) {
+              signed01 = 0.0f;
+            } else if (normRaw > hi) {
+              float t = (normRaw - hi) / (1.0f - hi);
+              t = clamp01(t);
+              signed01 = +t;
+            } else { // normRaw < lo
+              float t = (lo - normRaw) / (lo - 0.0f);
+              t = clamp01(t);
+              signed01 = -t;
+            }
+
+            outSend = mapf(signed01, -1.0f, 1.0f, cfg.minOut, cfg.maxOut);
+
+          } else { // SPLIT_SINGLE_CENTERED
+            // centered in [0..2], center=1, deadband => 1
+            float centered;
+            if (inDead) {
+              centered = 1.0f;
+            } else if (normRaw >= hi) {
+              float t = (normRaw - hi) / (1.0f - hi);
+              t = clamp01(t);
+              centered = 1.0f + t;      // 1..2
+            } else { // normRaw <= lo
+              float t = (lo - normRaw) / (lo - 0.0f);
+              t = clamp01(t);
+              centered = 1.0f - t;      // 0..1
+            }
+
+            outSend = mapf(centered, 0.0f, 2.0f, cfg.minOut, cfg.maxOut);
+          }
+
+          // EMA opcional del split single
+          if (!splitEMAInit[i]) { splitEMA[i] = outSend; splitEMAInit[i] = true; }
+          else splitEMA[i] = (1.0f - cfg.suavizado) * splitEMA[i] + cfg.suavizado * outSend;
+          outSend = splitEMA[i];
+
+          // THRESH + envío
+          {
+            const float thr = potThreshold[i];
+            bool doSend = false;
+            if (isnan(lastSingle[i])) doSend = true;
+            else if (fabsf(outSend - lastSingle[i]) >= thr) doSend = true;
+
+            if (doSend) {
+              if (cfg.enviarComoEntero) {
+                enviar(String(tag) + "=" + String((int)lroundf(outSend)));
+              } else {
+                char f[24];
+                dtostrf(outSend, 0, 3, f);
+                char* p = f; while (*p==' ') ++p;
+                enviar(String(tag) + "=" + String(p));
+              }
+              lastSingle[i] = outSend;
+              potLastMs[i] = now;
+            }
+          }
+
+          debeEnviar = false;
+          break;
+        }
+
+        // ============================================================
+        // C) CAMBIO normal (sin NOTCH, sin SPLIT)
+        // ============================================================
+        {
           bool enviarCambio = false;
           float prev = potOutLast[i];
           float thr  = potThreshold[i];
 
-          if (isnan(prev)) {
-            enviarCambio = true;
-          } else if (fabs(outVal - prev) >= thr) {
-            enviarCambio = true;
-          }
+          if (isnan(prev)) enviarCambio = true;
+          else if (fabsf(outVal - prev) >= thr) enviarCambio = true;
 
           if (enviarCambio) {
             if (cfg.enviarComoEntero) {
@@ -1640,9 +2170,8 @@ void tickPots() {
           }
 
           debeEnviar = false;
+          break;
         }
-
-        break;
       }
 
       case 2: // INTERVALO
@@ -1656,11 +2185,14 @@ void tickPots() {
     }
 
     // =======================
-    // 4) ENVÍO FINAL
+    // 4) ENVÍO FINAL (CONTINUO / INTERVALO)
     // =======================
     if (debeEnviar) {
       if (potNotchCount[i] > 0) {
         int idxN = (potLastNotch[i] < 0) ? 0 : potLastNotch[i];
+        if (idxN < 0) idxN = 0;
+        if (idxN >= potNotchCount[i]) idxN = potNotchCount[i] - 1;
+
         float notchVal = potNotchVals[i][idxN];
 
         if (cfg.enviarComoEntero) {
@@ -1689,11 +2221,248 @@ void tickPots() {
   }
 }
 
+
+// ===================== RENAME helpers =====================
+
+static bool renamePinParam(uint8_t pin, const char* newName) {
+  uint8_t count = EE::read(0);
+  if (count == 0xFF) return false;
+
+  for (int i = 0; i < count; i++) {
+    PinConfig cfg;
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+    if (cfg.pin == pin) {
+      strncpy(cfg.param, newName, sizeof(cfg.param));
+      cfg.param[sizeof(cfg.param) - 1] = '\0';
+      EE_PUT(1 + i * sizeof(PinConfig), cfg);
+      EE::commit();
+      return true;
+    }
+  }
+  return false;
+}
+
+static int renameAllByName(const char* oldName, const char* newName) {
+  uint8_t count = EE::read(0);
+  if (count == 0xFF) return 0;
+
+  int changed = 0;
+  for (int i = 0; i < count; i++) {
+    PinConfig cfg;
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+
+    if (strcasecmp(cfg.param, oldName) == 0) {
+      strncpy(cfg.param, newName, sizeof(cfg.param));
+      cfg.param[sizeof(cfg.param) - 1] = '\0';
+      EE_PUT(1 + i * sizeof(PinConfig), cfg);
+      changed++;
+    }
+  }
+  if (changed) EE::commit();
+  return changed;
+}
+
+void tickIoStates() {
+  unsigned long now = millis();
+
+  // Frecuencia máxima de comprobación
+  if (now - lastIoStateMs < 30) return;
+  lastIoStateMs = now;
+
+  // ===================== BUTTONS =====================
+  for (int i = 0; i < buttonCount; i++) {
+    if (!buttonPins[i]) continue;
+
+    int value = buttonPins[i]->digitalRead() == LOW ? 1 : 0;
+
+    if (value != lastButtonState[i]) {
+      lastButtonState[i] = value;
+
+      enviar(
+        String("IO.STATE ") +
+        String(buttonPinNum[i]) +
+        " BUTTON " +
+        String(value)
+      );
+    }
+  }
+
+  // ===================== SWITCHES =====================
+  for (int i = 0; i < switchCount; i++) {
+    if (!switchPins[i]) continue;
+
+    int value = switchPins[i]->digitalRead() == LOW ? 1 : 0;
+
+    if (value != lastSwitchState[i]) {
+      lastSwitchState[i] = value;
+
+      enviar(
+        String("IO.STATE ") +
+        String(switchPinNum[i]) +
+        " SWITCH " +
+        String(value)
+      );
+    }
+  }
+
+  // ===================== OUTPUTS =====================
+  for (int i = 0; i < outputCount; i++) {
+    if (!outputPins[i]) continue;
+
+    int value = outputPins[i]->digitalRead() == HIGH ? 1 : 0;
+
+    if (value != lastOutputState[i]) {
+      lastOutputState[i] = value;
+
+      enviar(
+        String("IO.STATE ") +
+        String(outputPinNum[i]) +
+        " OUTPUT " +
+        String(value)
+      );
+    }
+  }
+
+  // ===================== POTS =====================
+  for (int i = 0; i < potCount; i++) {
+    const PinConfig& cfg = potCfgs[i];
+
+    int value = 0;
+
+    if (isADSIndex(cfg.pin)) {
+      uint8_t ch = adsChannel(cfg.pin);
+
+      if (!g_ads_ok || ch > 3) continue;
+
+      if (adsCacheOk[ch]) {
+        value = adsRawCache[ch];
+      } else {
+        int16_t r = g_ads.readADC_SingleEnded(ch);
+        value = r < 0 ? 0 : (int)r;
+      }
+    } else {
+      value = analogRead(cfg.pin);
+    }
+
+    // Evita ruido analógico
+    if (lastPotState[i] == -9999 || abs(value - lastPotState[i]) > 8) {
+      lastPotState[i] = value;
+
+      enviar(
+        String("IO.STATE ") +
+        pinToStringForDump(cfg.pin, 3) +
+        " POT " +
+        String(value)
+      );
+    }
+  }
+}
+
+void handleIoCommand(const String& cmd) {
+  char kind[16];
+  char state[8];
+  int pin = -1;
+  int value = 0;
+
+  if (sscanf(cmd.c_str(), "IO.WATCH %d %15s %7s", &pin, kind, state) == 3) {
+    if (pin < 0 || pin > 255) {
+      enviar(String("IO.ERROR PIN ") + pin);
+      return;
+    }
+
+    if (strcasecmp(state, "ON") == 0 || strcmp(state, "1") == 0) {
+      ioWatchEnabled = true;
+      ioWatchPin = (uint8_t)pin;
+
+      strncpy(ioWatchKind, kind, sizeof(ioWatchKind));
+      ioWatchKind[sizeof(ioWatchKind) - 1] = '\0';
+
+      ioWatchLastValue = -9999;
+
+      int result = readIoLiveValue(ioWatchPin, ioWatchKind);
+      ioWatchLastValue = result;
+
+      enviar(String("IO.WATCH OK ") + pin + " " + ioWatchKind + " ON");
+      enviar(String("IO.STATE ") + pin + " " + ioWatchKind + " " + result);
+      return;
+    }
+
+    if (strcasecmp(state, "OFF") == 0 || strcmp(state, "0") == 0) {
+      ioWatchEnabled = false;
+      ioWatchLastValue = -9999;
+
+      enviar(String("IO.WATCH OK ") + pin + " " + kind + " OFF");
+      return;
+    }
+
+    enviar(F("IO.ERROR WATCH"));
+    return;
+  }
+
+  if (sscanf(cmd.c_str(), "IO.READ %d %15s", &pin, kind) == 2) {
+    if (pin < 0 || pin > 255) {
+      enviar(String("IO.ERROR PIN ") + pin);
+      return;
+    }
+
+    int result = readIoLiveValue((uint8_t)pin, kind);
+    enviar(String("IO.STATE ") + pin + " " + kind + " " + result);
+    return;
+  }
+
+  if (sscanf(cmd.c_str(), "IO.WRITE %d %d", &pin, &value) == 2) {
+    if (pin < 0 || pin > 127) {
+      enviar(String("IO.ERROR PIN ") + pin);
+      return;
+    }
+
+    IOPin* p = busMCP.getPin(pin, false);
+    if (!p) {
+      enviar(String("IO.ERROR PIN ") + pin);
+      return;
+    }
+
+    p->pinMode(OUTPUT);
+    p->digitalWrite(value ? HIGH : LOW);
+
+    enviar(String("IO.STATE ") + pin + " OUTPUT " + (value ? 1 : 0));
+    return;
+  }
+
+  enviar(String("IO.ERROR CMD ") + cmd);
+}
+
+void tickIoWatch() {
+  if (!ioWatchEnabled) return;
+
+  unsigned long now = millis();
+  if (now - ioWatchLastMs < 20) return;
+  ioWatchLastMs = now;
+
+  int value = readIoLiveValue(ioWatchPin, ioWatchKind);
+
+  if (value != ioWatchLastValue) {
+    ioWatchLastValue = value;
+    enviar(String("IO.STATE ") + ioWatchPin + " " + ioWatchKind + " " + value);
+  }
+}
+
 // ========= handleLine (comandos) =========
 void handleLine(const char* command, const char* value) {
   if (!command || !*command) return;
 
+  // --- cleanup helpers (para no dejar flags colgados en returns tempranos) ---
+  auto _hend = [&]() {
+    bloqueado = false;
+  #if defined(MODO_ETHERNET)
+    bloqueaTCP = false;
+  #endif
+  };
+
+#define HRET() do { _hend(); return; } while (0)
+
 #if defined(MODO_ETHERNET)
+  // Mientras procesamos un comando, suspendemos el procesamiento TCP (evita “interferencias”)
   bloqueaTCP = true;
 #endif
 
@@ -1703,10 +2472,16 @@ void handleLine(const char* command, const char* value) {
   cmd.trim();
   val.trim();
 
+  // ===================== IO live wizard =====================
+  if (cmd.startsWith("IO.")) {
+    handleIoCommand(cmd);
+    HRET();
+  }
+
   // ===================== MODBUS passthrough =====================
   if (cmd.startsWith("MB.") || cmd.startsWith("MODBUS.")) {
     handleMbCommand(cmd);
-    return;
+    HRET();
   }
 
   // ===================== ETH helpers =====================
@@ -1734,9 +2509,9 @@ void handleLine(const char* command, const char* value) {
     s += " SERVER.IP=";
     s += (hasSrv ? srvIp.toString() : "0.0.0.0");
     s += " SERVER.PORT=";
-    s += String(5090); // o kClientServerPort si lo prefieres
+    s += String(5090); // o kClientServerPort
     enviar(s);
-    return;
+    HRET();
   }
 
   if (cmd.startsWith("ETH.OUT")) {
@@ -1747,6 +2522,7 @@ void handleLine(const char* command, const char* value) {
     }
     arg.trim();
     arg.toUpperCase();
+
     if (arg == "ON" || arg == "1" || arg == "TRUE") {
       ethOutEnabled = true;
       enviar(F("OK ETH.OUT ON"));
@@ -1756,7 +2532,7 @@ void handleLine(const char* command, const char* value) {
     } else {
       enviar(F("ERR ETH.OUT (usa ON|OFF)"));
     }
-    return;
+    HRET();
   }
 #endif
 
@@ -1775,7 +2551,7 @@ void handleLine(const char* command, const char* value) {
     } else {
       enviar(String("ERR SERVER.IP inválida: ") + ipS);
     }
-    return;
+    HRET();
   }
 
   // ===================== Modo CONFIG =====================
@@ -1783,7 +2559,7 @@ void handleLine(const char* command, const char* value) {
     modoConfig = true;
     bloqueado  = false;
     enviar(F("✅ MODO CONFIG ACTIVADO"));
-    return;
+    HRET();
   }
 
   if (cmd.equalsIgnoreCase("#END")) {
@@ -1796,7 +2572,7 @@ void handleLine(const char* command, const char* value) {
     if (!apActive) {
 #if defined(__AVR__)
       wdt_enable(WDTO_15MS);
-      while (1);
+      while (1) {}
 #else
       ESP.restart();
 #endif
@@ -1805,8 +2581,190 @@ void handleLine(const char* command, const char* value) {
       loadConfigFromEEPROM();
       notchLoadAllFromEEPROM();
     }
-    bloqueado = false;
-    return;
+    HRET();
+  }
+
+  // ===================== POT.SPLIT.* (dual throttle/brake o palanca única) =====================
+  // Requiere #CONFIG
+  if (cmd.startsWith("POT.SPLIT")) {
+    if (!modoConfig) { enviar(F("❌ POT.SPLIT requiere #CONFIG")); HRET(); }
+
+    String full = cmd;
+    if (val.length()) { full += " "; full += val; }
+    full.trim();
+
+    auto needIdx = [&](const char* pinS)->int{
+      int pin = analogPinFromString(pinS);
+      int idx = getPotIndexByPin((uint8_t)pin);
+      if (idx < 0) enviar(F("❌ POT.SPLIT: pin no es POT"));
+      return idx;
+    };
+
+    if (full.startsWith("POT.SPLIT.TAGS")) {
+      char pinS[16], t1[64], t2[64];
+      if (sscanf(full.c_str(), "POT.SPLIT.TAGS %15s %63s %63s", pinS, t1, t2) == 3) {
+        int idx = needIdx(pinS);
+        if (idx < 0) HRET();
+
+        if (potTagFwd[idx])  free(potTagFwd[idx]);
+        if (potTagBack[idx]) free(potTagBack[idx]);
+        potTagFwd[idx]  = strdup(t1);
+        potTagBack[idx] = strdup(t2);
+
+        potSplitMode[idx] = SPLIT_DUAL;
+        enviar(String("✅ OK POT.SPLIT.TAGS ") + pinS + " FWD=" + t1 + " BACK=" + t2);
+        notchSaveAllToEEPROM();
+        HRET();
+      }
+      enviar(F("❌ Formato: POT.SPLIT.TAGS <pin> <tagFwd> <tagBack>"));
+      HRET();
+    }
+
+    if (full.startsWith("POT.SPLIT.TAG")) {
+      char pinS[16], t[64];
+      if (sscanf(full.c_str(), "POT.SPLIT.TAG %15s %63s", pinS, t) == 2) {
+        int idx = needIdx(pinS);
+        if (idx < 0) HRET();
+
+        if (potTagSingle[idx]) free(potTagSingle[idx]);
+        potTagSingle[idx] = strdup(t);
+
+        if (potSplitMode[idx] == SPLIT_OFF) potSplitMode[idx] = SPLIT_SINGLE_SIGNED;
+
+        enviar(String("✅ OK POT.SPLIT.TAG ") + pinS + " TAG=" + t);
+        notchSaveAllToEEPROM();
+        HRET();
+      }
+      enviar(F("❌ Formato: POT.SPLIT.TAG <pin> <tagSingle>"));
+      HRET();
+    }
+
+    if (full.startsWith("POT.SPLIT.DB")) {
+      char pinS[16]; float db=0;
+      if (sscanf(full.c_str(), "POT.SPLIT.DB %15s %f", pinS, &db) == 2) {
+        int idx = needIdx(pinS);
+        if (idx < 0) HRET();
+        if (db < 0) db = 0;
+        if (db > 0.3f) db = 0.3f;
+        potSplitDeadband[idx] = db;
+        enviar(String("✅ OK POT.SPLIT.DB ") + pinS + " " + String(db,3));
+        notchSaveAllToEEPROM();
+        HRET();
+      }
+      enviar(F("❌ Formato: POT.SPLIT.DB <pin> <0..0.3>"));
+      HRET();
+    }
+
+    if (full.startsWith("POT.SPLIT.CBIAS")) {
+      char pinS[16]; float cb=0.5f;
+      if (sscanf(full.c_str(), "POT.SPLIT.CBIAS %15s %f", pinS, &cb) == 2) {
+        int idx = needIdx(pinS);
+        if (idx < 0) HRET();
+        if (cb < 0) cb = 0;
+        if (cb > 1.0f) cb = 1.0f;
+        potSplitCenterBias[idx] = cb;
+        enviar(String("✅ OK POT.SPLIT.CBIAS ") + pinS + " " + String(cb,3));
+        notchSaveAllToEEPROM();
+        HRET();
+      }
+      enviar(F("❌ Formato: POT.SPLIT.CBIAS <pin> <0..1>"));
+      HRET();
+    }
+
+    // POT.SPLIT <pin> OFF|DUAL|SIGNED|CENTERED
+    {
+      char pinS[16], modeS[16];
+      if (sscanf(full.c_str(), "POT.SPLIT %15s %15s", pinS, modeS) == 2) {
+        int idx = needIdx(pinS);
+        if (idx < 0) HRET();
+
+        String ms = String(modeS); ms.toUpperCase();
+        if (ms=="OFF") {
+          potSplitMode[idx] = SPLIT_OFF;
+          enviar(String("✅ OK POT.SPLIT ") + pinS + " OFF");
+          notchSaveAllToEEPROM();
+          HRET();
+        }
+        if (ms=="DUAL") {
+          potSplitMode[idx] = SPLIT_DUAL;
+          enviar(String("✅ OK POT.SPLIT ") + pinS + " DUAL");
+          notchSaveAllToEEPROM();
+          HRET();
+        }
+        if (ms=="SIGNED") {
+          potSplitMode[idx] = SPLIT_SINGLE_SIGNED;
+          enviar(String("✅ OK POT.SPLIT ") + pinS + " SIGNED");
+          notchSaveAllToEEPROM();
+          HRET();
+        }
+        if (ms=="CENTERED") {
+          potSplitMode[idx] = SPLIT_SINGLE_CENTERED;
+          enviar(String("✅ OK POT.SPLIT ") + pinS + " CENTERED");
+          notchSaveAllToEEPROM();
+          HRET();
+        }
+
+        enviar(F("❌ POT.SPLIT: modo inválido (OFF|DUAL|SIGNED|CENTERED)"));
+        HRET();
+      }
+    }
+
+    enviar(F("❌ POT.SPLIT: comando inválido"));
+    HRET();
+  }
+
+  // ===================== RENAME commands =====================
+  if (modoConfig && cmd.startsWith("RENAME.")) {
+
+    if (cmd.startsWith("RENAME.PIN")) {
+      char pinStr[16], newName[40];
+
+      if (sscanf(cmd.c_str(), "RENAME.PIN %15s %39s", pinStr, newName) == 2) {
+        int pin = analogPinFromString(pinStr);
+        if (pin < 0 || pin > 255) {
+          enviar(F("❌ RENAME.PIN: pin inválido"));
+          HRET();
+        }
+
+        if (renamePinParam((uint8_t)pin, newName)) {
+          loadConfigFromEEPROM();
+          notchLoadAllFromEEPROM();
+          modbusRefreshWindow();
+          enviar(String("✅ OK RENAME.PIN ") + pin + " -> " + newName);
+        } else {
+          enviar(F("❌ RENAME.PIN: pin no encontrado"));
+        }
+        HRET();
+      }
+
+      enviar(F("❌ Formato: RENAME.PIN <pin> <newName>"));
+      HRET();
+    }
+
+    if (cmd.startsWith("RENAME.NAME")) {
+      char oldName[40], newName[40];
+
+      if (sscanf(cmd.c_str(), "RENAME.NAME %39s %39s", oldName, newName) == 2) {
+        int n = renameAllByName(oldName, newName);
+
+        if (n > 0) {
+          loadConfigFromEEPROM();
+          notchLoadAllFromEEPROM();
+          modbusRefreshWindow();
+          enviar(String("✅ OK RENAME.NAME '") + oldName +
+                 "' -> '" + newName + "' (" + n + " cambios)");
+        } else {
+          enviar(F("❌ RENAME.NAME: no hubo coincidencias"));
+        }
+        HRET();
+      }
+
+      enviar(F("❌ Formato: RENAME.NAME <oldName> <newName>"));
+      HRET();
+    }
+
+    enviar(F("❌ RENAME.* desconocido"));
+    HRET();
   }
 
   if (cmd.equalsIgnoreCase("#CLEAR")) {
@@ -1816,29 +2774,23 @@ void handleLine(const char* command, const char* value) {
     delay(100);
     enviar(F("#READY"));
     modbusRefreshWindow();
-    return;
+    HRET();
   }
 
-  // ✅ FALTABA: NVSWIPE (injertado del otro handleLine)
   if (cmd.equalsIgnoreCase("#NVSWIPE")) {
     nvsWipeAllAndReboot();
-    return;
+    HRET();
   }
 
   if (cmd.equalsIgnoreCase("#BOARD?")) {
     enviar(String("BOARD ") + getBoardType());
-    return;
+    HRET();
   }
 
   // ===================== SEL.* (nuevo API) =====================
-  // Formatos:
-  //   SEL.ADD <name> <pin> <val>
-  //   SEL.CLEAR
-  //   SEL.DELPIN <pin>
-  //   SEL.DUMP
   if (cmd.startsWith("SEL.")) {
     if (cmd.equalsIgnoreCase("SEL.CLEAR")) {
-      if (!modoConfig) { enviar(F("❌ SEL.CLEAR requiere #CONFIG")); return; }
+      if (!modoConfig) { enviar(F("❌ SEL.CLEAR requiere #CONFIG")); HRET(); }
 
       eepromDeleteAllByType(4);
       clearSelectorsRAM();
@@ -1847,22 +2799,22 @@ void handleLine(const char* command, const char* value) {
       modbusRefreshWindow();
 
       enviar(F("✅ OK SEL.CLEAR"));
-      return;
+      HRET();
     }
 
     if (cmd.equalsIgnoreCase("SEL.DUMP")) {
       enviar(F("BEGIN SEL"));
       dumpSelectorsAsSEL_ADD();
       enviar(F("END SEL"));
-      return;
+      HRET();
     }
 
     if (cmd.startsWith("SEL.DELPIN")) {
-      if (!modoConfig) { enviar(F("❌ SEL.DELPIN requiere #CONFIG")); return; }
+      if (!modoConfig) { enviar(F("❌ SEL.DELPIN requiere #CONFIG")); HRET(); }
       char pinStr[16];
       if (sscanf(cmd.c_str(), "SEL.DELPIN %15s", pinStr) == 1) {
         int pin = analogPinFromString(pinStr);
-        if (pin < 0 || pin > 127) { enviar(F("❌ SEL.DELPIN: pin inválido")); return; }
+        if (pin < 0 || pin > 127) { enviar(F("❌ SEL.DELPIN: pin inválido")); HRET(); }
 
         bool ok = eepromDeletePinIfType((uint8_t)pin, 4);
         clearSelectorsRAM();
@@ -1871,14 +2823,14 @@ void handleLine(const char* command, const char* value) {
         modbusRefreshWindow();
 
         enviar(ok ? F("✅ OK SEL.DELPIN") : F("❌ SEL.DELPIN: pin no encontrado"));
-        return;
+        HRET();
       }
       enviar(F("❌ Formato: SEL.DELPIN <pin>"));
-      return;
+      HRET();
     }
 
     if (cmd.startsWith("SEL.ADD")) {
-      if (!modoConfig) { enviar(F("❌ SEL.ADD requiere #CONFIG")); return; }
+      if (!modoConfig) { enviar(F("❌ SEL.ADD requiere #CONFIG")); HRET(); }
 
       char name[40], pinStr[16], valStr[16];
       int n = sscanf(cmd.c_str(), "SEL.ADD %39s %15s %15s", name, pinStr, valStr);
@@ -1886,13 +2838,13 @@ void handleLine(const char* command, const char* value) {
         int pin = analogPinFromString(pinStr);
         int v   = atoi(valStr);
 
-        if (pin < 0 || pin > 127) { enviar(F("❌ SEL.ADD: pin inválido (solo MCP 0..127)")); return; }
+        if (pin < 0 || pin > 127) { enviar(F("❌ SEL.ADD: pin inválido (solo MCP 0..127)")); HRET(); }
 
         int sidx = getOrCreateSelector(name);
-        if (sidx < 0) { enviar(F("❌ SEL.ADD: sin espacio en selectors[]")); return; }
+        if (sidx < 0) { enviar(F("❌ SEL.ADD: sin espacio en selectors[]")); HRET(); }
 
         IOPin* pinObj = busMCP.getPin(pin, true);
-        if (!pinObj) { enviar(F("❌ SEL.ADD: pinObj nulo")); return; }
+        if (!pinObj) { enviar(F("❌ SEL.ADD: pinObj nulo")); HRET(); }
 
         pinObj->pinMode(INPUT_PULLUP);
         selectors[sidx]->add(pinObj, (int16_t)v);
@@ -1901,15 +2853,15 @@ void handleLine(const char* command, const char* value) {
         savePinConfig("SELECTOR", pin, name, v1, "0");
 
         enviar(String("✅ OK SEL.ADD ") + name + " PIN=" + String(pin) + " VAL=" + String(v));
-        return;
+        HRET();
       }
 
       enviar(F("❌ Formato: SEL.ADD <name> <pin> <val>"));
-      return;
+      HRET();
     }
 
     enviar(F("❌ SEL.* desconocido (usa SEL.ADD / SEL.CLEAR / SEL.DELPIN / SEL.DUMP)"));
-    return;
+    HRET();
   }
 
   // ===================== #DELETEPIN =====================
@@ -1974,12 +2926,12 @@ void handleLine(const char* command, const char* value) {
 
     } else {
       enviar(String("❌ No se encontró configuración para el pin ") +
-             pinToStringForDump((uint8_t)pinToDelete, 3));
+              pinToStringForDump((uint8_t)pinToDelete, 3));
       enviar(String("NOT_FOUND_PIN ") +
-             pinToStringForDump((uint8_t)pinToDelete, 3));
+              pinToStringForDump((uint8_t)pinToDelete, 3));
     }
-    bloqueado = false;
-    return;
+
+    HRET();
   }
 
   // ===================== #SCANPINS =====================
@@ -1988,21 +2940,16 @@ void handleLine(const char* command, const char* value) {
     int totalPins = chips * 16;
     enviar(String("🔎 MCP detectados: ") + chips);
     enviar(String("🔌 Pines totales disponibles: ") + totalPins);
-    bloqueado = false;
-    return;
+    HRET();
   }
 
   // ===================== NOTCH commands =====================
-  // ✅ FALTABA: aquí va el bloque NOTCH COMPLETO (injertado del handleLine viejo)
   if (modoConfig && cmd.startsWith("NOTCH")) {
     String s = cmd;
     s.trim();
     int sp1 = s.indexOf(' ');
-    if (sp1 < 0) {
-      enviar(F("ERR NOTCH"));
-      bloqueado=false;
-      return;
-    }
+    if (sp1 < 0) { enviar(F("ERR NOTCH")); HRET(); }
+
     String sub = s.substring(sp1+1);
     sub.trim();
     int sp2 = sub.indexOf(' ');
@@ -2016,8 +2963,8 @@ void handleLine(const char* command, const char* value) {
         enviar("NOTCH PIN " + p +
                 " COUNT " + String(potNotchCount[i]) +
                 " HYST " + String(potNotchHystPct[i], 3) +
-                " CENTERS " +
-                String(potNotchHasCenters[i] ? "YES" : "NO"));
+                " CENTERS " + String(potNotchHasCenters[i] ? "YES" : "NO"));
+
         if (potNotchCount[i] > 0) {
           String lv = "NOTCH LIST.VALS " + p + " ";
           String lc = "NOTCH LIST.CENT " + p + " ";
@@ -2029,82 +2976,146 @@ void handleLine(const char* command, const char* value) {
           enviar(lv);
           enviar(lc);
         }
+
         int idx = getPotIndexByPin(cfg.pin);
         if (idx >= 0) {
           enviar(String("NOTCH PARTIAL ") + p + " " + (potPartial[idx] ? "ON":"OFF"));
           enviar(String("NOTCH SNAPWIN ") + p + " " + String(potSnapWin[idx],3));
         }
       }
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("SAVEALL")) {
       if (notchSaveAllToEEPROM()) enviar(F("OK NOTCH SAVEALL"));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("LOADALL")) {
       notchLoadAllFromEEPROM();
       enviar(F("OK NOTCH LOADALL"));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("PARTIAL")) {
       int sp = sub.indexOf(' ');
-      if (sp < 0) { enviar(F("ERR NOTCH PARTIAL")); bloqueado=false; return; }
+      if (sp < 0) { enviar(F("ERR NOTCH PARTIAL")); HRET(); }
       String rest = sub.substring(sp+1);
       rest.trim();
       int sp2b = rest.indexOf(' ');
-      if (sp2b < 0) { enviar(F("ERR NOTCH PARTIAL")); bloqueado=false; return; }
+      if (sp2b < 0) { enviar(F("ERR NOTCH PARTIAL")); HRET(); }
       String pinStr = rest.substring(0, sp2b);
       pinStr.trim();
       String onoff = rest.substring(sp2b+1);
       onoff.trim();
+
       int pin = analogPinFromString(pinStr.c_str());
       int idx = getPotIndexByPin((uint8_t)pin);
-      if (idx < 0) { enviar(F("ERR NOTCH PARTIAL pin")); bloqueado=false; return; }
+      if (idx < 0) { enviar(F("ERR NOTCH PARTIAL pin")); HRET(); }
+
       bool on = onoff.equalsIgnoreCase("ON") || onoff == "1" || onoff.equalsIgnoreCase("TRUE");
       potPartial[idx] = on;
       enviar(String("OK NOTCH PARTIAL ") +
               pinToStringForDump((uint8_t)pin,3) +
               " " + (on? "ON":"OFF"));
-      bloqueado=false;
-      return;
+      HRET();
+    }
+
+    // ===================== NOTCH HYBRIDSEG =====================
+    if (op.equalsIgnoreCase("HYBRIDSEG")) {
+    
+      int sp = sub.indexOf(' ');
+      if (sp < 0) {
+        enviar(F("ERR NOTCH HYBRIDSEG"));
+        HRET();
+      }
+    
+      String rest = sub.substring(sp + 1);
+      rest.trim();
+    
+      int sp2 = rest.indexOf(' ');
+      if (sp2 < 0) {
+        enviar(F("ERR NOTCH HYBRIDSEG"));
+        HRET();
+      }
+    
+      String pinStr = rest.substring(0, sp2);
+      pinStr.trim();
+    
+      String rest2 = rest.substring(sp2 + 1);
+      rest2.trim();
+    
+      int pin = analogPinFromString(pinStr.c_str());
+      int idx = getPotIndexByPin((uint8_t)pin);
+      if (idx < 0) {
+        enviar(F("ERR NOTCH HYBRIDSEG pin"));
+        HRET();
+      }
+    
+      // ---------- OFF ----------
+      if (rest2.equalsIgnoreCase("OFF")) {
+        potHybridSegEn[idx] = false;
+      
+        enviar(String("OK NOTCH HYBRIDSEG ") +
+               pinToStringForDump((uint8_t)pin, 3) +
+               " OFF");
+      
+        notchSaveAllToEEPROM();
+        HRET();
+      }
+    
+      // ---------- ON: A B ----------
+      int a = -1, b = -1;
+      if (sscanf(rest2.c_str(), "%d %d", &a, &b) != 2) {
+        enviar(F("ERR NOTCH HYBRIDSEG formato (usa OFF o <A> <B>)"));
+        HRET();
+      }
+    
+      if (a < 0 || b < 0 || a >= potNotchCount[idx] || b >= potNotchCount[idx] || a == b) {
+        enviar(F("ERR NOTCH HYBRIDSEG índices inválidos"));
+        HRET();
+      }
+    
+      potHybridSegEn[idx] = true;
+      potHybridSegA[idx]  = (uint8_t)a;
+      potHybridSegB[idx]  = (uint8_t)b;
+    
+      enviar(String("OK NOTCH HYBRIDSEG ") +
+             pinToStringForDump((uint8_t)pin, 3) +
+             " " + String(a) + " " + String(b));
+    
+      notchSaveAllToEEPROM();
+      HRET();
     }
 
     if (op.equalsIgnoreCase("SNAPWIN")) {
       int sp = sub.indexOf(' ');
-      if (sp < 0) { enviar(F("ERR NOTCH SNAPWIN")); bloqueado=false; return; }
+      if (sp < 0) { enviar(F("ERR NOTCH SNAPWIN")); HRET(); }
       String rest = sub.substring(sp+1);
       rest.trim();
       int sp2b = rest.indexOf(' ');
-      if (sp2b < 0) { enviar(F("ERR NOTCH SNAPWIN")); bloqueado=false; return; }
+      if (sp2b < 0) { enviar(F("ERR NOTCH SNAPWIN")); HRET(); }
       String pinStr = rest.substring(0, sp2b);
       pinStr.trim();
       String pctStr = rest.substring(sp2b+1);
       pctStr.trim();
+
       int pin = analogPinFromString(pinStr.c_str());
       int idx = getPotIndexByPin((uint8_t)pin);
-      if (idx < 0) { enviar(F("ERR NOTCH SNAPWIN pin")); bloqueado=false; return; }
+      if (idx < 0) { enviar(F("ERR NOTCH SNAPWIN pin")); HRET(); }
+
       float pct = pctStr.toFloat();
       if (pct < 0.0f) pct = 0.0f;
       if (pct > 0.3f) pct = 0.3f;
       potSnapWin[idx] = pct;
+
       enviar(String("OK NOTCH SNAPWIN ") +
               pinToStringForDump((uint8_t)pin,3) +
               " " + String(pct,3));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
-    if (sp2 < 0) {
-      enviar(F("ERR NOTCH params"));
-      bloqueado=false;
-      return;
-    }
+    if (sp2 < 0) { enviar(F("ERR NOTCH params")); HRET(); }
 
     String rest = sub.substring(sp2+1);
     rest.trim();
@@ -2114,19 +3125,13 @@ void handleLine(const char* command, const char* value) {
       pinStr.trim();
       int pin = analogPinFromString(pinStr.c_str());
       int poti = getPotIndexByPin((uint8_t)pin);
-      if (poti < 0) {
-        enviar(F("ERR NOTCH RAW pin"));
-        bloqueado=false;
-        return;
-      }
+      if (poti < 0) { enviar(F("ERR NOTCH RAW pin")); HRET(); }
+
       int raw = 0;
       if (isADSIndex(potCfgs[poti].pin)) {
-        if (!g_ads_ok) { enviar(F("ERR NOTCH RAW ADS no listo")); bloqueado=false; return; }
-
+        if (!g_ads_ok) { enviar(F("ERR NOTCH RAW ADS no listo")); HRET(); }
         uint8_t ch = adsChannel(potCfgs[poti].pin);
-
         int16_t r = g_ads.readADC_SingleEnded(ch);
-
         if (r < 0) r = 0;
         raw = (int)r;
       } else {
@@ -2136,112 +3141,102 @@ void handleLine(const char* command, const char* value) {
       enviar("OK NOTCH RAW " +
               pinToStringForDump((uint8_t)pin,3) +
               " RAW " + String(raw));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("CLEAR")) {
       int pin = analogPinFromString(rest.c_str());
       int idx = getPotIndexByPin((uint8_t)pin);
-      if (idx < 0) { enviar(F("ERR NOTCH CLEAR pin")); bloqueado=false; return; }
+      if (idx < 0) { enviar(F("ERR NOTCH CLEAR pin")); HRET(); }
+
       potNotchCount[idx]=0;
       potLastNotch[idx]=-1;
       potEmaNorm[idx]=NAN;
       potEmaRaw[idx]=NAN;
       potNotchHasCenters[idx]=false;
+
       enviar("OK NOTCH CLEAR " + pinToStringForDump((uint8_t)pin,3));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("ADD")) {
       int sp = rest.indexOf(' ');
-      if (sp < 0) { enviar(F("ERR NOTCH ADD")); bloqueado=false; return; }
+      if (sp < 0) { enviar(F("ERR NOTCH ADD")); HRET(); }
       String pinStr = rest.substring(0, sp);
       pinStr.trim();
       String valStr = rest.substring(sp+1);
       valStr.trim();
+
       int pin = analogPinFromString(pinStr.c_str());
       int idx = getPotIndexByPin((uint8_t)pin);
-      if (idx < 0) { enviar(F("ERR NOTCH ADD pin")); bloqueado=false; return; }
-      if (potNotchCount[idx] >= MAX_NOTCHES) {
-        enviar(F("ERR NOTCH ADD max 30"));
-        bloqueado=false;
-        return;
-      }
+      if (idx < 0) { enviar(F("ERR NOTCH ADD pin")); HRET(); }
+      if (potNotchCount[idx] >= MAX_NOTCHES) { enviar(F("ERR NOTCH ADD max 30")); HRET(); }
+
       float v = valStr.toFloat();
       potNotchVals[idx][ potNotchCount[idx]++ ] = v;
+
       enviar("OK NOTCH ADD " +
               pinToStringForDump((uint8_t)pin,3) +
               " " + String(v,3));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("ADDHERE")) {
       int sp = rest.indexOf(' ');
-      if (sp < 0) { enviar(F("ERR NOTCH ADDHERE")); bloqueado=false; return; }
+      if (sp < 0) { enviar(F("ERR NOTCH ADDHERE")); HRET(); }
       String pinStr = rest.substring(0, sp);
       pinStr.trim();
       String valStr = rest.substring(sp+1);
       valStr.trim();
+
       int pin = analogPinFromString(pinStr.c_str());
       int idx = getPotIndexByPin((uint8_t)pin);
-      if (idx < 0) { enviar(F("ERR NOTCH ADDHERE pin")); bloqueado=false; return; }
-      if (potNotchCount[idx] >= MAX_NOTCHES) {
-        enviar(F("ERR NOTCH ADDHERE max 30"));
-        bloqueado=false;
-        return;
-      }
+      if (idx < 0) { enviar(F("ERR NOTCH ADDHERE pin")); HRET(); }
+      if (potNotchCount[idx] >= MAX_NOTCHES) { enviar(F("ERR NOTCH ADDHERE max 30")); HRET(); }
+
       int raw = 0;
       if (isADSIndex(potCfgs[idx].pin)) {
-        if (!g_ads_ok) { enviar(F("ERR NOTCH ADDHERE ADS no listo")); bloqueado=false; return; }
-
+        if (!g_ads_ok) { enviar(F("ERR NOTCH ADDHERE ADS no listo")); HRET(); }
         uint8_t ch = adsChannel(potCfgs[idx].pin);
-
         int16_t r = g_ads.readADC_SingleEnded(ch);
-
         if (r < 0) r = 0;
         raw = (int)r;
       } else {
         raw = analogRead(potCfgs[idx].pin);
       }
+
       uint8_t k = potNotchCount[idx]++;
       potNotchCenterRaw[idx][k] = (uint16_t)raw;
       potNotchVals[idx][k]      = valStr.toFloat();
       potNotchHasCenters[idx]   = true;
+
       enviar("OK NOTCH ADDHERE " +
               pinToStringForDump((uint8_t)pin,3) +
               " RAW " + String(raw) +
               " VAL " + String(potNotchVals[idx][k],3));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("CAP")) {
       int sp = rest.indexOf(' ');
-      if (sp < 0) { enviar(F("ERR NOTCH CAP")); bloqueado=false; return; }
+      if (sp < 0) { enviar(F("ERR NOTCH CAP")); HRET(); }
       String pinStr = rest.substring(0, sp);
       pinStr.trim();
       String idxStr = rest.substring(sp+1);
       idxStr.trim();
+
       int pin = analogPinFromString(pinStr.c_str());
       int poti = getPotIndexByPin((uint8_t)pin);
-      if (poti < 0) { enviar(F("ERR NOTCH CAP pin")); bloqueado=false; return; }
+      if (poti < 0) { enviar(F("ERR NOTCH CAP pin")); HRET(); }
+
       int k = idxStr.toInt();
-      if (k < 0 || k >= potNotchCount[poti]) {
-        enviar(F("ERR NOTCH CAP idx"));
-        bloqueado=false;
-        return;
-      }
+      if (k < 0 || k >= potNotchCount[poti]) { enviar(F("ERR NOTCH CAP idx")); HRET(); }
+
       int raw = 0;
       if (isADSIndex(potCfgs[poti].pin)) {
-        if (!g_ads_ok) { enviar(F("ERR NOTCH CAP ADS no listo")); bloqueado=false; return; }
-
+        if (!g_ads_ok) { enviar(F("ERR NOTCH CAP ADS no listo")); HRET(); }
         uint8_t ch = adsChannel(potCfgs[poti].pin);
-
         int16_t r = g_ads.readADC_SingleEnded(ch);
-
         if (r < 0) r = 0;
         raw = (int)r;
       } else {
@@ -2250,69 +3245,78 @@ void handleLine(const char* command, const char* value) {
 
       potNotchCenterRaw[poti][k] = (uint16_t)raw;
       potNotchHasCenters[poti]   = true;
+
       enviar("OK NOTCH CAP " +
               pinToStringForDump((uint8_t)pin,3) +
               " IDX " + String(k) +
               " RAW " + String(raw));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("VAL")) {
       int spA = rest.indexOf(' ');
       int spB = rest.indexOf(' ', spA+1);
-      if (spA < 0 || spB < 0) { enviar(F("ERR NOTCH VAL")); bloqueado=false; return; }
+      if (spA < 0 || spB < 0) { enviar(F("ERR NOTCH VAL")); HRET(); }
+
       String pinStr = rest.substring(0, spA);
       pinStr.trim();
       String idxStr = rest.substring(spA+1, spB);
       idxStr.trim();
       String valStr = rest.substring(spB+1);
       valStr.trim();
+
       int pin = analogPinFromString(pinStr.c_str());
       int poti = getPotIndexByPin((uint8_t)pin);
-      if (poti < 0) { enviar(F("ERR NOTCH VAL pin")); bloqueado=false; return; }
+      if (poti < 0) { enviar(F("ERR NOTCH VAL pin")); HRET(); }
+
       int k = idxStr.toInt();
-      if (k < 0 || k >= potNotchCount[poti]) { enviar(F("ERR NOTCH VAL idx")); bloqueado=false; return; }
+      if (k < 0 || k >= potNotchCount[poti]) { enviar(F("ERR NOTCH VAL idx")); HRET(); }
+
       potNotchVals[poti][k] = valStr.toFloat();
+
       enviar("OK NOTCH VAL " +
               pinToStringForDump((uint8_t)pin,3) +
               " IDX " + String(k) +
               " VAL " + String(potNotchVals[poti][k],3));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("HYST")) {
       int sp = rest.indexOf(' ');
-      if (sp < 0) { enviar(F("ERR NOTCH HYST")); bloqueado=false; return; }
+      if (sp < 0) { enviar(F("ERR NOTCH HYST")); HRET(); }
+
       String pinStr = rest.substring(0, sp);
       pinStr.trim();
       String valStr = rest.substring(sp+1);
       valStr.trim();
+
       int pin = analogPinFromString(pinStr.c_str());
       int idx = getPotIndexByPin((uint8_t)pin);
-      if (idx < 0) { enviar(F("ERR NOTCH HYST pin")); bloqueado=false; return; }
+      if (idx < 0) { enviar(F("ERR NOTCH HYST pin")); HRET(); }
+
       float pct = valStr.toFloat();
       if (pct < 0)    pct=0;
       if (pct>0.3f) pct=0.3f;
       potNotchHystPct[idx] = pct;
+
       enviar("OK NOTCH HYST " +
               pinToStringForDump((uint8_t)pin,3) +
               " " + String(pct,3));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("DUMP")) {
       String pinStr = rest;
       int pin = analogPinFromString(pinStr.c_str());
       int idx = getPotIndexByPin((uint8_t)pin);
-      if (idx < 0) { enviar(F("ERR NOTCH DUMP pin")); bloqueado=false; return; }
+      if (idx < 0) { enviar(F("ERR NOTCH DUMP pin")); HRET(); }
+
       enviar("NOTCH PIN " +
               pinToStringForDump((uint8_t)pin,3) +
               " COUNT " + String(potNotchCount[idx]) +
               " HYST " + String(potNotchHystPct[idx],3) +
               " CENTERS " + String(potNotchHasCenters[idx] ? "YES" : "NO"));
+
       if (potNotchCount[idx] > 0) {
         String lv = "NOTCH LIST.VALS " + pinToStringForDump((uint8_t)pin,3) + " ";
         String lc = "NOTCH LIST.CENT " + pinToStringForDump((uint8_t)pin,3) + " ";
@@ -2324,25 +3328,25 @@ void handleLine(const char* command, const char* value) {
         enviar(lv);
         enviar(lc);
       }
+
       enviar(String("NOTCH PARTIAL ") +
               pinToStringForDump((uint8_t)pin,3) +
               " " + (potPartial[idx] ? "ON":"OFF"));
+
       enviar(String("NOTCH SNAPWIN ") +
               pinToStringForDump((uint8_t)pin,3) +
               " " + String(potSnapWin[idx],3));
-      bloqueado=false;
-      return;
+
+      HRET();
     }
 
     if (op.equalsIgnoreCase("SAVE")) {
       int pin = analogPinFromString(rest.c_str());
-      (void)pin;
       if (notchSaveOneToEEPROM((uint8_t)pin))
         enviar("OK NOTCH SAVE " + pinToStringForDump((uint8_t)pin,3));
       else
         enviar(F("ERR NOTCH SAVE"));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     if (op.equalsIgnoreCase("DEL")) {
@@ -2351,13 +3355,11 @@ void handleLine(const char* command, const char* value) {
         enviar("OK NOTCH DEL " + pinToStringForDump((uint8_t)pin,3));
       else
         enviar(F("ERR NOTCH DEL"));
-      bloqueado=false;
-      return;
+      HRET();
     }
 
     enviar(F("ERR NOTCH ?"));
-    bloqueado=false;
-    return;
+    HRET();
   }
 
   // ===================== #DUMP =====================
@@ -2433,8 +3435,36 @@ void handleLine(const char* command, const char* value) {
             }
             enviar(lv);
             if (potNotchHasCenters[idx]) enviar(lc);
+
             enviar(String("NOTCH PARTIAL ") + pinToStringForDump(cfg.pin,cfg.type) + " " + (potPartial[idx] ? "ON":"OFF"));
             enviar(String("NOTCH SNAPWIN ") + pinToStringForDump(cfg.pin,cfg.type) + " " + String(potSnapWin[idx],3));
+          }
+
+          if (potSplitMode[idx] != SPLIT_OFF) {
+            String p = pinToStringForDump(cfg.pin, cfg.type);
+
+            String mode;
+            if      (potSplitMode[idx] == SPLIT_DUAL)            mode = "DUAL";
+            else if (potSplitMode[idx] == SPLIT_SINGLE_SIGNED)   mode = "SIGNED";
+            else if (potSplitMode[idx] == SPLIT_SINGLE_CENTERED) mode = "CENTERED";
+            else                                                 mode = "OFF";
+
+            enviar("POT.SPLIT " + p + " " + mode);
+            enviar("POT.SPLIT.DB " + p + " " + String(potSplitDeadband[idx], 3));
+            enviar("POT.SPLIT.CBIAS " + p + " " + String(potSplitCenterBias[idx], 3));
+
+            if (potSplitMode[idx] == SPLIT_DUAL) {
+              if (potTagFwd[idx] && potTagBack[idx]) {
+                enviar(String("POT.SPLIT.TAGS ") + p + " " + potTagFwd[idx] + " " + potTagBack[idx]);
+              }
+              if (potTagSingle[idx] && potTagSingle[idx][0]) {
+                enviar(String("POT.SPLIT.TAG ") + p + " " + potTagSingle[idx]);
+              }
+            } else {
+              if (potTagSingle[idx] && potTagSingle[idx][0]) {
+                enviar(String("POT.SPLIT.TAG ") + p + " " + potTagSingle[idx]);
+              }
+            }
           }
         }
       }
@@ -2449,7 +3479,6 @@ void handleLine(const char* command, const char* value) {
                     ",\"pots\":" + potCount + "}";
     enviar(resumen);
 
-    // opcional, venía en el viejo
     enviar("MB.WINDOW base/size ya informada");
 
     enviar("BEGIN MB");
@@ -2457,8 +3486,7 @@ void handleLine(const char* command, const char* value) {
     enviar("END MB");
 
     enviar(F("✅ DUMP COMPLETO FIN"));
-    bloqueado = false;
-    return;
+    HRET();
   }
 
   // ===================== ADD (legacy) =====================
@@ -2526,15 +3554,13 @@ void handleLine(const char* command, const char* value) {
       enviar(String("❌ ERROR: Formato ADD inválido → ") + cmd);
     }
 
-    bloqueado = false;
-    return;
+    HRET();
   }
 
   // ===================== CFG (POT params) =====================
   if (modoConfig && cmd.startsWith("CFG")) {
     updatePotParam(cmd);
-    bloqueado = false;
-    return;
+    HRET();
   }
 
   // ===================== Entrada clave=valor (outputs + MB.SET) =====================
@@ -2559,18 +3585,18 @@ void handleLine(const char* command, const char* value) {
         if (outputs[i] && outputParams[i] && strcasecmp(outputParams[i], key.c_str()) == 0) {
           outputs[i]->outputDigital(key.c_str(), v.c_str(), 1);
           enviar("✅ ACK: " + key + "=" + v);
-          return;
+          HRET();
         }
       }
 
       String mb = buildModbusSetFromKV(key, v);
       if (mb.length()) {
         handleMbCommand(mb);
-        return;
+        HRET();
       }
 
       enviar("❌ NACK: " + key + "=" + v);
-      return;
+      HRET();
     }
   }
 
@@ -2582,11 +3608,66 @@ void handleLine(const char* command, const char* value) {
   if (handled) enviar("✅ ACK: " + String(command));
   else         enviar("❌ NACK: " + String(command));
 
-  bloqueado = false;
+  HRET();
+
+#undef HRET
 }
 
-
 // ========= AP / LED =========
+void handleAPButton() {
+  const unsigned long now = millis();
+  const unsigned long DEBOUNCE_MS = 40;
+  const unsigned long LONG_MS     = longPressTime; // 2000
+
+  static int stable = HIGH;
+  static int lastRaw = HIGH;
+  static unsigned long lastEdgeMs = 0;
+  static bool longFired = false;
+  static unsigned long pressStartMs = 0;
+
+  int raw = digitalRead(PIN_BTN_AP); // GPIO15 (LOW = pressed)
+
+  // debounce
+  if (raw != lastRaw) {
+    lastRaw = raw;
+    lastEdgeMs = now;
+  }
+  if ((now - lastEdgeMs) > DEBOUNCE_MS && raw != stable) {
+    stable = raw;
+
+    if (stable == LOW) {
+      // pressed
+      pressStartMs = now;
+      longFired = false;
+    } else {
+      // released
+      longFired = false;
+    }
+  }
+
+  // long press
+  if (stable == LOW && !longFired && (now - pressStartMs) >= LONG_MS) {
+    longFired = true;
+
+    // Toggle AP
+    if (!apActive) enableAP();
+    else           disableAP();
+
+    oledRequest();
+  }
+}
+
+static void flushLedIfDirty() {
+  if (!ledDirty) return;
+
+  const unsigned long now = millis();
+  if (now - lastLedFlush < 15) return; // limita refresco
+
+  pixels.show();
+  ledDirty = false;
+  lastLedFlush = now;
+}
+
 void enableAP() {
   if (apActive) return;
 
@@ -2636,14 +3717,24 @@ void disableAP() {
   setLed(0,0,0);
 }
 
+static void toolReboot() {
+#ifdef ESP32
+  ESP.restart();
+#endif
+}
+
+AsyncWebServer serverOTA(80);
+
 // ======================= setup/loop =======================
 void setup() {
   #if defined(MODO_SERIAL)
     Serial.begin(SERIAL_BAUD);
   #endif
 
-  EE::begin(16384);
+  EE::begin(EE_SIZE_BYTES);
   EE_ensureCountByte();
+
+  ElegantOTA.begin(&serverOTA);
 
   for (int i=0;i<EEPROM_MAX_ENTRIES;i++){
     potEMA[i]=NAN;
@@ -2660,6 +3751,13 @@ void setup() {
     potEmaRaw[i]    = NAN;
     potPartial[i]   = false;
     potSnapWin[i]   = 0.03f;
+    potTagFwd[i] = nullptr;
+    potTagBack[i] = nullptr;
+    potTagSingle[i] = nullptr;
+    potHybridSegEn[i] = false;
+    potHybridSegA[i]  = 0;
+    potHybridSegB[i]  = 0;
+    potSplitResetRAM(i);
   }
 
   for (int i=0;i<MAX_SELECTORS;i++){ selectors[i]=nullptr; selectorNames[i]=nullptr; }
@@ -2675,21 +3773,35 @@ void setup() {
 
   // ===== OLED SSD1306 =====
   Wire.begin(PIN_SDA, PIN_SCL);
-  I2CBUS1.begin(21, 14);
+  I2CBUS1.begin(OLED_SDA, OLED_SCL);
 
-  scanBus(I2CBUS1, "OLED");
-  oledOK = true;  
-  display.begin();
-  display.setI2CAddress(0x3C << 1);
+  //scanBus(I2CBUS1, "OLED");
+  #if defined(SSD1306)
+  oledOK = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   Serial.printf("oledOK=%d\n", oledOK ? 1 : 0);
   if (oledOK) {
-    display.clearBuffer();
-    display.setFont(u8g2_font_5x8_tf);
-    display.drawStr(0, 10, "OLED OK");
-    display.drawStr(0, 20, "INICIANDO..");
-    display.sendBuffer();
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("OLED OK");
+    display.println("INICIANDO..");
+    display.display();
   }
-
+  #elif defined(SSD1309)
+    oledOK = true;  
+    display.begin();
+    display.setI2CAddress(0x3C << 1);
+    Serial.printf("oledOK=%d\n", oledOK ? 1 : 0);
+    if (oledOK) {
+      display.clearBuffer();
+      display.setFont(u8g2_font_5x8_tf);
+      display.drawStr(0, 10, "OLED OK");
+      display.drawStr(0, 20, "INICIANDO..");
+      display.sendBuffer();
+    }
+  #endif
+  
   // ADS1115
   g_ads_ok = g_ads.begin(0x48);
   if (g_ads_ok) {
@@ -2699,20 +3811,23 @@ void setup() {
     Serial.println(F("⚠️ ADS1115 no detectado (0x48)."));
   }
 
-
   pixels.begin();
   pixels.setBrightness(30);
   setLed(0,0,0);
+  pixels.show();
+  ETH.setHostname("EASYSIM_ETH");
 
 #if defined(MODO_ETHERNET) && defined(ESP32)
   WiFi.mode(WIFI_OFF);
   delay(50);
   Network.onEvent(onEthEvent);
+  
   if (!ETH.begin(ETH_PHY_W5500, 1, CS_W5500, W5500_IRQ, W5500_RST, SPIBUS)) {
     Serial.println("❌ ETH.begin() falló");
   } else {
     Serial.println("✅ ETH.begin() ok, esperando IP...");
   }
+
 
   {
     ethStaticFallbackUsed = false;
@@ -2780,6 +3895,11 @@ void setup() {
 
   // Ventana Modbus y autoload
   modbusInitWindowFromUsed();
+  Serial.printf("EE_SIZE=%u\n", EE_SIZE_BYTES);
+  Serial.printf("PINCFG_END=%u\n", (unsigned)(1 + EEPROM_MAX_ENTRIES * sizeof(PinConfig)));
+  Serial.printf("NOTCH: base=%u size=%u end=%u\n", NOTCH_REGION_BASE, NOTCH_REGION_SIZE, NOTCH_REGION_BASE+NOTCH_REGION_SIZE);
+  Serial.printf("MODBUS: base=%u size=%u end=%u\n", MB_REGION_BASE, MB_REGION_SIZE, MB_REGION_BASE+MB_REGION_SIZE);
+
   initModbusTCP();
 
   {
@@ -2802,6 +3922,11 @@ void setup() {
     Serial.println(busMCP.presentMask(), BIN);
   }
 
+  /*pcf.begin();
+  menu.begin();
+  menu.beginPCF(pcf, 0, 1, 2, 3, 4, 5, true);
+  menu.setOnToolReboot(toolReboot);
+  menu.open();*/
 
   #if defined(MODO_SERIAL)
     serialInterface.begin();
@@ -2822,30 +3947,23 @@ void setup() {
   for (int i = 0; i < selectorCount; i++) {
     if (selectors[i]) selectors[i]->begin();
   }
-
-  Serial.println("TEST: levantando AP 5s...");
-  WiFi.mode(WIFI_AP);
-  bool ok = WiFi.softAP("EASYSIM_TEST");
-  Serial.printf("TEST softAP=%d IP=%s\n", ok ? 1 : 0, WiFi.softAPIP().toString().c_str());
-  Serial.printf("AP IP=%s  SSID=%s  mode=%d\n",
-  WiFi.softAPIP().toString().c_str(),
-  WiFi.softAPSSID().c_str(),
-  (int)WiFi.getMode()
-  );
 }
 
 void loop() {
   // 1) refresca cache ADS (I2C corto y no bloqueante)
   adsPollCache();
+  handleAPButton();
 
   // 2) refresca OLED (I2C, no bloqueante)
   oledMaybeDrawChangeOnly();
   pollButtonsESP32();  
+  tickIoStates();
+  tickIoWatch();
 
   // 3) networking / serial
   #if defined(MODO_ETHERNET)
     if (ethernetInterface) ethernetInterface->update();
-    if (eth_connected) serverDiscovery.poll();
+    if (ETH.linkUp()) serverDiscovery.poll();
   #endif
 
   #if defined(MODO_SERIAL)
@@ -2894,6 +4012,12 @@ void loop() {
   #endif
 
   tickModbus();
+  ElegantOTA.loop();
+
+  /*if (menu.isActive()) {
+    menu.tick();
+    return;
+  }*/
 
   // 4) IO (MCP) + POTS
   if (!modoConfig && !bloqueado) {
@@ -2903,6 +4027,6 @@ void loop() {
     for (int i = 0; i < selectorCount; i++) if (selectors[i]) selectors[i]->update();
     tickPots();
   }
+
+  flushLedIfDirty();
 }
-
-

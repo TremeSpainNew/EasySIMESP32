@@ -754,16 +754,21 @@ void enviar(const String& msg) {
 
 #if defined(MODO_ETHERNET)
   if (ethernetInterface && ethOutEnabled && !tcpSuspendidoPorSerial) {
-    ethernetInterface->println(msg); // a clientes en puerto 5000
-  }
-  if (serverDiscovery.connected()) {
-    serverDiscovery.println(msg);    // espejo al servidor 5090 si está conectado
+    ethernetInterface->println(msg); // puerto 5000 configuración/log
   }
 #endif
 
 #if defined(MODO_WIFI_AP)
   if (wifiClient && wifiClient.connected()) {
-    wifiClient.println(msg);         // espejo al cliente WiFi del AP
+    wifiClient.println(msg);         // AP configuración/log
+  }
+#endif
+}
+
+void enviarServidor(const String& msg) {
+#if defined(MODO_ETHERNET)
+  if (serverDiscovery.connected()) {
+    serverDiscovery.println(msg);
   }
 #endif
 }
@@ -779,22 +784,33 @@ static void trimInPlace(String &s){
   s = s.substring(i, j+1);
 }
 
-static bool parseBoolLike(const String& v, int &out){
-  String t=v;
+static bool parseValueToInt(const String& v, int &out) {
+  String t = v;
+  t.trim();
   t.toUpperCase();
-  trimInPlace(t);
-  if (t=="1"||t=="ON"||t=="TRUE"||t=="HIGH") { out=1; return true; }
-  if (t=="0"||t=="OFF"||t=="FALSE"||t=="LOW") { out=0; return true; }
 
-  bool allNum = t.length()>0;
-  for (int i=0;i<t.length();++i)
-    allNum &= isdigit((unsigned char)t[i]) || (i==0 && (t[i]=='-'||t[i]=='+'));
-
-  if (allNum) {
-    out = t.toInt();
+  if (t == "1" || t == "ON" || t == "TRUE" || t == "HIGH") {
+    out = 1;
     return true;
   }
-  return false;
+
+  if (t == "0" || t == "OFF" || t == "FALSE" || t == "LOW") {
+    out = 0;
+    return true;
+  }
+
+  // Acepta enteros y decimales: 67.47 -> 67 o 67.47 -> 67 redondeado
+  char *endptr = nullptr;
+  float f = strtof(t.c_str(), &endptr);
+
+  if (endptr == t.c_str()) {
+    return false;
+  }
+
+  out = (int)lroundf(f);   // redondea: 67.47 -> 67, 67.50 -> 68
+  // out = (int)f;         // usa esta línea si prefieres truncar siempre
+
+  return true;
 }
 
 static String buildModbusSetFromKV(const String& key, const String& valueCSV){
@@ -807,7 +823,7 @@ static String buildModbusSetFromKV(const String& key, const String& valueCSV){
     String token = (comma>=0) ? valueCSV.substring(start, comma) : valueCSV.substring(start);
     trimInPlace(token);
     int v;
-    if (!parseBoolLike(token, v)) return String();
+    if (!parseValueToInt(token, v)) return String();
     out += String(v);
     if (comma>=0) {
       out += " ";
@@ -1202,8 +1218,8 @@ void savePinConfig(const String& tipo, int pin, const char* param, const char* v
   EE_PUT(1 + count * sizeof(PinConfig), cfg);
   EE::write(0, count + 1);
   EE::commit();
+  loadConfigFromEEPROM();
   enviar(String("✅ Entrada añadida a EEPROM: ") + param);
-
   modbusRefreshWindow();
 }
 
@@ -1932,12 +1948,12 @@ void tickPots() {
 
           if (enviarAhora) {
             if (cfg.enviarComoEntero) {
-              enviar(String(potParams[i]) + "=" + String((int)lroundf(outHybrid)));
+              enviarServidor(String(potParams[i]) + "=" + String((int)lroundf(outHybrid)));
             } else {
               char f[24];
               dtostrf(outHybrid, 0, 3, f);
               char* p = f; while (*p==' ') ++p;
-              enviar(String(potParams[i]) + "=" + String(p));
+              enviarServidor(String(potParams[i]) + "=" + String(p));
             }
             potOutLast[i] = outHybrid;
             potLastMs[i]  = now;
@@ -2770,6 +2786,7 @@ void handleLine(const char* command, const char* value) {
   if (cmd.equalsIgnoreCase("#CLEAR")) {
     clearEEPROMIfNeeded();
     notchEraseRegion();
+    mbClearEEPROM();
     enviar(F("✅ EEPROM borrada correctamente."));
     delay(100);
     enviar(F("#READY"));
@@ -3861,17 +3878,21 @@ void setup() {
   serverDiscovery.onBeacon([](const IPAddress& ip, uint16_t port, const String& msg){
     enviar(String("📡 DISCOVERY: beacon desde ") +
           ip.toString() + ":" + String(port) +
-          " → " + msg);
+           " → " + msg);
   });
   serverDiscovery.onConnected([](const IPAddress& ip, uint16_t port){
     enviar(String("✅ CLIENT.CONNECT OK → ") +
           ip.toString() + ":" + String(port));
 
+   // OUTPUT normales
     for (int i = 0; i < outputCount; i++) {
       if (outputParams[i]) {
         enviar(String("register(") + outputParams[i] + ")");
       }
     }
+
+   // MODBUS tags
+   mbRegisterAllTags();   // habría que crear esta función en modbus.h/.cpp
   });
 
   serverDiscovery.onDisconnected([](){

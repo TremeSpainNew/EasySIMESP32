@@ -90,6 +90,7 @@ static ModbusRTU mbRtu;
 
 // ======================= IO hacia fuera (Serial/Eth) =======================
 extern void enviar(const String& msg); // implementada en tu main
+extern void enviarServidor(const String& msg); // implementada en tu main
 
 // ======================= Helpers de tabla =======================
 static int findFreeDev() {
@@ -534,6 +535,21 @@ static void mbClearEEPROM() {
   uint32_t magic = 0xFFFFFFFF;
   eeWrite(pos, magic);
   EE::commit();
+
+  memset(g_mbDevices, 0, sizeof(g_mbDevices));
+  memset(g_mbTags,    0, sizeof(g_mbTags));
+  memset(g_mbIOs,     0, sizeof(g_mbIOs));
+}
+
+inline void mbRegisterAllTags()
+{
+    for (int i = 0; i < MAX_MB_TAGS; i++) {
+        if (g_mbTags[i].used && g_mbTags[i].isOutput) {
+            enviarServidor(
+                String("register(") + g_mbTags[i].name + ")"
+            );
+        }
+    }
 }
 
 // ======================= API público para el main =======================
@@ -1123,7 +1139,7 @@ inline void handleMbCommand(const String& cmd) {
   // ---------- MB.CLEAR ----------
   if (cmd.startsWith("MB.CLEAR")) {
     mbClearEEPROM();
-    enviar("✅ MB.CLEAR OK");
+    enviar("✅ MB.CLEAR OK RAM+EEPROM");
     return;
   }
 

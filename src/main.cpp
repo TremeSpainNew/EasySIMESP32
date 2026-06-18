@@ -55,15 +55,16 @@ inline void EE_ensureCountByte() {
 bool bloqueaTCP = false;
 
 // ===================== LÍMITES/CONSTANTES EE =================
-static constexpr uint32_t EE_SIZE_BYTES = 24576; // 24 KB // total NVS simulada por EE
+static constexpr uint32_t EE_SIZE_BYTES = 32768; // 32 KB // total NVS simulada por EE
 
-// ======== Ventana Modbus (8 KB) al final ========
-static constexpr uint32_t MB_REGION_SIZE = 8192; // 8 KB
+static constexpr uint32_t MB_REGION_SIZE = 8192;
 static constexpr uint32_t MB_REGION_BASE = EE_SIZE_BYTES - MB_REGION_SIZE;
 
-// ======== Región NOTCH persistente (4 KB) ========
 static constexpr uint32_t NOTCH_REGION_SIZE = 4096;
-static constexpr uint32_t NOTCH_REGION_BASE = EE_SIZE_BYTES - MB_REGION_SIZE - NOTCH_REGION_SIZE;
+static constexpr uint32_t NOTCH_REGION_BASE = MB_REGION_BASE - NOTCH_REGION_SIZE;
+
+static constexpr uint32_t NET_REGION_SIZE = 256;
+static constexpr uint32_t NET_REGION_BASE = NOTCH_REGION_BASE - NET_REGION_SIZE;
 
 static constexpr uint32_t NOTCH_MAGIC = 0x4E544348; // 'N''T''C''H'
 static constexpr uint8_t  NOTCH_VERSION = 5;        // V4: partial+snapwin
@@ -2570,34 +2571,70 @@ void handleLine(const char* command, const char* value) {
     HRET();
   }
 
-  // ===================== Modo CONFIG =====================
-  if (cmd.equalsIgnoreCase("#CONFIG")) {
-    modoConfig = true;
-    bloqueado  = false;
-    enviar(F("✅ MODO CONFIG ACTIVADO"));
-    HRET();
+  // 🚀 NUEVO COMANDO PARA CAMBIAR LA IP ESTÁTICA
+  if (cmd.startsWith("ETH.SETIP")) {
+    String val = "";
+    int sp = cmd.indexOf(' ');
+    if (sp > 0) val = cmd.substring(sp + 1);
+    val.trim();
+    if (val.length() == 0) {
+      enviar(F("❌ Uso: ETH.SETIP 192.168.1.100"));
+      return;
+    }
+  
+    IPAddress newIp;
+  
+    if (!newIp.fromString(val)) {
+      enviar(F("❌ Error: IP no válida. Ejemplo: ETH.SETIP 192.168.1.50"));
+      return;
+    }
+  
+    EE::setStaticIP(newIp);
+    EE::setDhcpEnabled(false);
+    EE::commit();
+  
+    enviar(String("💾 IP estática guardada: ") + newIp.toString());
+    enviar(F("🔄 Reiniciando para aplicar configuración Ethernet..."));
+  
+    delay(500);
+    ESP.restart();
   }
 
-  if (cmd.equalsIgnoreCase("#END")) {
-    modoConfig = false;
-    enviar(F("✅ MODO CONFIG DESACTIVADO"));
-    delay(100);
-    enviar(F("#READY"));
-    delay(300);
-
-    if (!apActive) {
-#if defined(__AVR__)
-      wdt_enable(WDTO_15MS);
-      while (1) {}
-#else
-      ESP.restart();
-#endif
-    } else {
-      enviar(F("⚠️ AP activo, no se reinicia"));
-      loadConfigFromEEPROM();
-      notchLoadAllFromEEPROM();
+    // ===================== Modo CONFIG =====================
+    if (cmd.equalsIgnoreCase("#CONFIG")) {
+      modoConfig = true;
+      bloqueado  = false;
+      enviar(F("✅ MODO CONFIG ACTIVADO"));
+      HRET();
     }
-    HRET();
+
+    if (cmd.equalsIgnoreCase("#END")) {
+      modoConfig = false;
+      enviar(F("✅ MODO CONFIG DESACTIVADO"));
+      delay(100);
+      enviar(F("#READY"));
+      delay(300);
+
+      if (!apActive) {
+  #if defined(__AVR__)
+        wdt_enable(WDTO_15MS);
+        while (1) {}
+  #else
+        ESP.restart();
+  #endif
+      } else {
+        enviar(F("⚠️ AP activo, no se reinicia"));
+        loadConfigFromEEPROM();
+        notchLoadAllFromEEPROM();
+      }
+      HRET();
+  }
+
+  //PING
+
+  if (cmd.equalsIgnoreCase("PING")) {
+    enviar("PONG");
+    return;
   }
 
   // ===================== POT.SPLIT.* (dual throttle/brake o palanca única) =====================
@@ -3837,30 +3874,70 @@ void setup() {
 #if defined(MODO_ETHERNET) && defined(ESP32)
   WiFi.mode(WIFI_OFF);
   delay(50);
+
   Network.onEvent(onEthEvent);
-  
+
+  bool dhcpEnabled = EE::getDhcpEnabled();
+  IPAddress savedIp = EE::getStaticIP();
+
+  Serial.println("🌐 Iniciando Ethernet...");
+
   if (!ETH.begin(ETH_PHY_W5500, 1, CS_W5500, W5500_IRQ, W5500_RST, SPIBUS)) {
     Serial.println("❌ ETH.begin() falló");
   } else {
-    Serial.println("✅ ETH.begin() ok, esperando IP...");
+    Serial.println("✅ ETH.begin() ok");
+
+    if (!dhcpEnabled && savedIp != IPAddress(0, 0, 0, 0)) {
+      IPAddress gateway(savedIp[0], savedIp[1], savedIp[2], 1);
+      IPAddress subnet(255, 255, 255, 0);
+      IPAddress dns(8, 8, 8, 8);
+
+      Serial.print("📥 IP estática guardada encontrada: ");
+      Serial.println(savedIp);
+
+      if (ETH.config(savedIp, gateway, subnet, dns)) {
+        ethStaticFallbackUsed = true;
+        Serial.print("✅ IP estática aplicada → ");
+        Serial.println(ETH.localIP());
+      } else {
+        ethStaticFallbackUsed = false;
+        Serial.println("❌ No se pudo aplicar la IP estática guardada");
+      }
+    } else {
+      ethStaticFallbackUsed = false;
+      Serial.println("🌐 DHCP habilitado, esperando IP...");
+    }
   }
 
-
   {
-    ethStaticFallbackUsed = false;
     unsigned long t0 = millis();
-    while (ETH.localIP() == IPAddress(0,0,0,0) && (millis() - t0) < 5000) {
+
+    while (ETH.localIP() == IPAddress(0, 0, 0, 0) && (millis() - t0) < 5000) {
       delay(100);
     }
-    if (ETH.localIP() == IPAddress(0,0,0,0)) {
-      ETH.config(IPAddress(192,168,0,177),
-                IPAddress(192,168,0,1),
-                IPAddress(255,255,255,0));
+
+    if (ETH.localIP() == IPAddress(0, 0, 0, 0)) {
+      Serial.println("⚠️ No se obtuvo IP por DHCP ni estática guardada");
+
+      IPAddress fallbackIp(192, 168, 1, 177);
+      IPAddress fallbackGw(192, 168, 1, 1);
+      IPAddress fallbackMask(255, 255, 255, 0);
+      IPAddress fallbackDns(8, 8, 8, 8);
+
+      ETH.config(fallbackIp, fallbackGw, fallbackMask, fallbackDns);
       ethStaticFallbackUsed = true;
-      Serial.println("ℹ️ No DHCP → IP fija 192.168.0.177/24 (GW 192.168.0.1)");
+
+      Serial.print("ℹ️ IP fallback aplicada → ");
+      Serial.println(ETH.localIP());
     } else {
-      Serial.print("🌐 DHCP OK → IP ");
-      Serial.println(ETH.localIP().toString());
+      Serial.print("🌐 IP final → ");
+      Serial.println(ETH.localIP());
+
+      if (ethStaticFallbackUsed) {
+        Serial.println("📌 Modo IP: ESTÁTICA");
+      } else {
+        Serial.println("📌 Modo IP: DHCP");
+      }
     }
   }
 
@@ -3872,7 +3949,6 @@ void setup() {
   ethernetInterface->setUseEth(true);
   ethernetInterface->begin();
 
-  // ServerDiscovery
   serverDiscovery.begin();
 
   serverDiscovery.onBeacon([](const IPAddress& ip, uint16_t port, const String& msg){
@@ -3880,24 +3956,24 @@ void setup() {
           ip.toString() + ":" + String(port) +
            " → " + msg);
   });
+
   serverDiscovery.onConnected([](const IPAddress& ip, uint16_t port){
     enviar(String("✅ CLIENT.CONNECT OK → ") +
           ip.toString() + ":" + String(port));
 
-   // OUTPUT normales
     for (int i = 0; i < outputCount; i++) {
       if (outputParams[i]) {
         enviar(String("register(") + outputParams[i] + ")");
       }
     }
 
-   // MODBUS tags
-   mbRegisterAllTags();   // habría que crear esta función en modbus.h/.cpp
+    mbRegisterAllTags();
   });
 
   serverDiscovery.onDisconnected([](){
     enviar("⚠️ CLIENT.DISCONNECTED");
   });
+
   serverDiscovery.onLine([](const String& line){
     Serial.print(F("[Server] LINE: "));
     Serial.println(line);
@@ -3909,6 +3985,7 @@ void setup() {
 
     handleLine(line.c_str(), nullptr);
   });
+
   serverDiscovery.onError([](const String& err){
     enviar(String("❌ CLIENT.ERROR ") + err);
   });

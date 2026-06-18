@@ -5,6 +5,9 @@ static Preferences s_prefs;
 static bool s_ok = false;
 static size_t s_len = 0;
 
+#define EE_ADDR_ETH_DHCP   24000
+#define EE_ADDR_ETH_IP     24001
+
 static void makeKey(uint32_t addr, char* out, size_t outlen) {
   // clave estable a partir del offset
   // k + 8 dígitos (cubre hasta 99.999.999)
@@ -48,6 +51,32 @@ void EE::put(uint32_t addr, const void* src, size_t len) {
   if (!s_ok || !src || !len) return;
   char key[16]; makeKey(addr, key, sizeof(key));
   s_prefs.putBytes(key, src, len);
+}
+
+void EE::setDhcpEnabled(bool enabled) {
+  write(EE_ADDR_ETH_DHCP, enabled ? 1 : 0);
+}
+
+bool EE::getDhcpEnabled() {
+  uint8_t v = read(EE_ADDR_ETH_DHCP);
+  if (v == 0xFF) return true;   // por defecto DHCP
+  return v != 0;
+}
+
+void EE::setStaticIP(IPAddress ip) {
+  uint8_t raw[4] = { ip[0], ip[1], ip[2], ip[3] };
+  put(EE_ADDR_ETH_IP, raw, 4);
+}
+
+IPAddress EE::getStaticIP() {
+  uint8_t raw[4] = { 0, 0, 0, 0 };
+  get(EE_ADDR_ETH_IP, raw, 4);
+
+  if (raw[0] == 0xFF || raw[0] == 0) {
+    return IPAddress(0, 0, 0, 0);
+  }
+
+  return IPAddress(raw[0], raw[1], raw[2], raw[3]);
 }
 
 void EE::commit() {

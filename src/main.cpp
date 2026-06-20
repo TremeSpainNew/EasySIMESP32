@@ -23,6 +23,15 @@
 #include "EthernetInterface.h"  // interfaz TCP puerto 5000
 #include <ServerDiscovery.h>    // NUEVO: discover+cliente 5090 con callbacks
 
+#include "CanManager.h"
+
+#define CAN_TX_PIN GPIO_NUM_1
+#define CAN_RX_PIN GPIO_NUM_2
+
+#define PIN_TYPE_CAN_BUTTON 5
+#define PIN_TYPE_CAN_SWITCH 6
+#define PIN_TYPE_CAN_OUTPUT 7
+
 //#include <PCF8574.h>
 
 #define SSD1306
@@ -2464,6 +2473,140 @@ void tickIoWatch() {
   }
 }
 
+static bool parseCanRef(const char* s, uint8_t& node, uint8_t& channel) {
+  if (!s) return false;
+
+  if (strncasecmp(s, "CAN", 3) != 0) return false;
+
+  const char* p = s + 3;
+  if (!isdigit((unsigned char)*p)) return false;
+
+  int n = atoi(p);
+
+  const char* colon = strchr(p, ':');
+  if (!colon) return false;
+
+  int ch = atoi(colon + 1);
+
+  if (n < 0 || n > 255 || ch < 0 || ch > 255) return false;
+
+  node = (uint8_t)n;
+  channel = (uint8_t)ch;
+  return true;
+}
+
+static bool saveCanConfig(const String& tipo, uint8_t node, uint8_t channel, const char* param) {
+  uint8_t count = EE::read(0);
+  if (count >= EEPROM_MAX_ENTRIES) {
+    enviar(F("❌ EEPROM llena"));
+    return false;
+  }
+
+  for (int i = 0; i < count; i++) {
+    PinConfig cfg{};
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+
+    if ((cfg.type == PIN_TYPE_CAN_BUTTON ||
+         cfg.type == PIN_TYPE_CAN_SWITCH ||
+         cfg.type == PIN_TYPE_CAN_OUTPUT) &&
+        cfg.minIn == node &&
+        cfg.pin == channel) {
+      enviar(F("❌ CAN ya configurado en ese nodo/canal"));
+      return false;
+    }
+  }
+
+  PinConfig cfg{};
+
+  if (tipo.equalsIgnoreCase("BUTTON")) {
+    cfg.type = PIN_TYPE_CAN_BUTTON;
+  } else if (tipo.equalsIgnoreCase("SWITCH")) {
+    cfg.type = PIN_TYPE_CAN_SWITCH;
+  } else if (tipo.equalsIgnoreCase("OUTPUT")) {
+    cfg.type = PIN_TYPE_CAN_OUTPUT;
+  } else {
+    enviar(F("❌ Tipo CAN no soportado"));
+    return false;
+  }
+
+  cfg.pin = channel;
+  cfg.minIn = node;
+  cfg.maxIn = channel;
+  cfg.minOut = 0;
+  cfg.maxOut = 1;
+  cfg.suavizado = 0;
+  cfg.modoEnvio = 1;
+  cfg.intervalo = 0;
+  cfg.enviarComoEntero = true;
+
+  strncpy(cfg.param, param, sizeof(cfg.param));
+  cfg.param[sizeof(cfg.param) - 1] = '\0';
+
+  EE_PUT(1 + count * sizeof(PinConfig), cfg);
+  EE::write(0, count + 1);
+  EE::commit();
+
+  enviar(String("✅ CAN añadido: ") +
+         tipo + " CAN" + String(node) + ":" + String(channel) +
+         " " + String(param));
+
+  return true;
+}
+
+static void handleCanInput(uint8_t node, uint8_t channel, uint8_t value) {
+  uint8_t count = EE::read(0);
+
+  for (int i = 0; i < count && i < EEPROM_MAX_ENTRIES; i++) {
+    PinConfig cfg{};
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+
+    if ((cfg.type == PIN_TYPE_CAN_BUTTON || cfg.type == PIN_TYPE_CAN_SWITCH) &&
+        cfg.minIn == node &&
+        cfg.pin == channel) {
+
+      String kv = String(cfg.param) + "=" + String(value ? 1 : 0);
+
+      enviar(kv);
+      enviarServidor(kv);
+
+      return;
+    }
+  }
+
+  enviar(String("⚠️ CAN INPUT sin asignar: CAN") +
+         String(node) + ":" + String(channel) +
+         "=" + String(value));
+}
+
+static bool tryCanOutputByName(const char* name, int value) {
+  if (!name || !name[0]) return false;
+
+  uint8_t count = EE::read(0);
+
+  for (int i = 0; i < count && i < EEPROM_MAX_ENTRIES; i++) {
+    PinConfig cfg{};
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+
+    if (cfg.type == PIN_TYPE_CAN_OUTPUT &&
+        strcasecmp(cfg.param, name) == 0) {
+
+      uint8_t node = (uint8_t)cfg.minIn;
+      uint8_t ch   = cfg.pin;
+      uint8_t val  = value ? 1 : 0;
+
+      canManager.sendOutputSet(node, ch, val);
+
+      enviar(String("📤 CAN OUTPUT: CAN") +
+             String(node) + ":" + String(ch) +
+             "=" + String(val));
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
 // ========= handleLine (comandos) =========
 void handleLine(const char* command, const char* value) {
   if (!command || !*command) return;
@@ -3549,6 +3692,31 @@ void handleLine(const char* command, const char* value) {
     int args = sscanf(cmd.c_str() + 4, "%19s %15s %39s %15s %15s", tipo, pinStr, param, v1, v2);
 
     if (args == 5) {
+      // ---- ADD CAN ----
+      // Ejemplos:
+      // ADD BUTTON CAN1:0 PZB_WACHSAM 0 1
+      // ADD SWITCH CAN1:1 LZB_ON 0 1
+      // ADD OUTPUT CAN1:0 PZB_LED 0 1
+      uint8_t canNode = 0;
+      uint8_t canChannel = 0;
+
+      if (parseCanRef(pinStr, canNode, canChannel)) {
+        if (strcasecmp(tipo, "BUTTON") == 0 ||
+            strcasecmp(tipo, "SWITCH") == 0 ||
+            strcasecmp(tipo, "OUTPUT") == 0) {
+
+          saveCanConfig(String(tipo), canNode, canChannel, param);
+
+          enviar(String("✅ CAN ") + tipo +
+                 " CAN" + String(canNode) + ":" + String(canChannel) +
+                 " -> " + String(param));
+          HRET();
+        }
+
+        enviar(String("❌ Tipo CAN no soportado en ADD → ") + tipo);
+        HRET();
+      }
+
       int pin = analogPinFromString(pinStr);
 
       if (strcasecmp(tipo, "OUTPUT") == 0) {
@@ -3639,6 +3807,16 @@ void handleLine(const char* command, const char* value) {
         if (outputs[i] && outputParams[i] && strcasecmp(outputParams[i], key.c_str()) == 0) {
           outputs[i]->outputDigital(key.c_str(), v.c_str(), 1);
           enviar("✅ ACK: " + key + "=" + v);
+          HRET();
+        }
+      }
+
+      // ---- Salidas CAN por nombre ----
+      // Ejemplo: PZB_LED=1 -> CAN OUTPUT configurado como PZB_LED
+      int outVal = 0;
+      if (parseValueToInt(v, outVal)) {
+        if (tryCanOutputByName(key.c_str(), outVal)) {
+          enviar("✅ ACK CAN: " + key + "=" + v);
           HRET();
         }
       }
@@ -4020,6 +4198,28 @@ void setup() {
     Serial.println(busMCP.presentMask(), BIN);
   }
 
+  //CANBUS Devices
+
+  canManager.begin(CAN_TX_PIN, CAN_RX_PIN, 500000);
+
+  canManager.onInput([](uint8_t node, uint8_t channel, uint8_t value) {
+    handleCanInput(node, channel, value);
+  });
+
+  canManager.onHello([](uint8_t node) {
+    enviar(String("✅ CAN HELLO node=") + String(node));
+  });
+
+  canManager.onHeartbeat([](uint8_t node) {
+    // opcional, no saturar log
+  });
+
+  canManager.onOutputAck([](uint8_t node, uint8_t channel, uint8_t value) {
+    enviar(String("✅ CAN ACK CAN") +
+            String(node) + ":" + String(channel) +
+            "=" + String(value));
+  });
+
   /*pcf.begin();
   menu.begin();
   menu.beginPCF(pcf, 0, 1, 2, 3, 4, 5, true);
@@ -4057,6 +4257,7 @@ void loop() {
   pollButtonsESP32();  
   tickIoStates();
   tickIoWatch();
+  canManager.loop();
 
   // 3) networking / serial
   #if defined(MODO_ETHERNET)

@@ -18,7 +18,7 @@
 //#include <io/Menu.h>
 #include <ElegantOTA.h>      // NUEVO: ElegantOTA para actualizaciones vía web
 #include <math.h>               // isnan, fabs, lroundf
-#include <Adafruit_ADS1X15.h>   // ADS1115
+#include <Adafruit_ADS1X15.h>   // ADS1115<<
 #include <WiFiUdp.h>            // UDP para discover (usado dentro de ServerDiscovery normalmente)
 #include "EthernetInterface.h"  // interfaz TCP puerto 5000
 #include <ServerDiscovery.h>    // NUEVO: discover+cliente 5090 con callbacks
@@ -744,6 +744,13 @@ int analogPinFromString(const char* str) {
 
 static inline String pinToStringForDump(uint8_t pin, uint8_t type){
   if (type==3 && isADSIndex(pin)) {
+    return String("ADS") + String(adsChannel(pin));
+  }
+  return String((int)pin);
+}
+
+static inline String pinToStringForIo(uint8_t pin, const char* kind) {
+  if (kind && strcasecmp(kind, "POT") == 0 && isADSIndex(pin)) {
     return String("ADS") + String(adsChannel(pin));
   }
   return String((int)pin);
@@ -2385,14 +2392,17 @@ void tickIoStates() {
 }
 
 void handleIoCommand(const String& cmd) {
+  char pinStr[16];
   char kind[16];
   char state[8];
   int pin = -1;
   int value = 0;
 
-  if (sscanf(cmd.c_str(), "IO.WATCH %d %15s %7s", &pin, kind, state) == 3) {
+  if (sscanf(cmd.c_str(), "IO.WATCH %15s %15s %7s", pinStr, kind, state) == 3) {
+    pin = analogPinFromString(pinStr);
+
     if (pin < 0 || pin > 255) {
-      enviar(String("IO.ERROR PIN ") + pin);
+      enviar(String("IO.ERROR PIN ") + pinStr);
       return;
     }
 
@@ -2408,8 +2418,9 @@ void handleIoCommand(const String& cmd) {
       int result = readIoLiveValue(ioWatchPin, ioWatchKind);
       ioWatchLastValue = result;
 
-      enviar(String("IO.WATCH OK ") + pin + " " + ioWatchKind + " ON");
-      enviar(String("IO.STATE ") + pin + " " + ioWatchKind + " " + result);
+      String pinText = pinToStringForIo(ioWatchPin, ioWatchKind);
+      enviar(String("IO.WATCH OK ") + pinText + " " + ioWatchKind + " ON");
+      enviar(String("IO.STATE ") + pinText + " " + ioWatchKind + " " + result);
       return;
     }
 
@@ -2417,7 +2428,8 @@ void handleIoCommand(const String& cmd) {
       ioWatchEnabled = false;
       ioWatchLastValue = -9999;
 
-      enviar(String("IO.WATCH OK ") + pin + " " + kind + " OFF");
+      String pinText = pinToStringForIo((uint8_t)pin, kind);
+      enviar(String("IO.WATCH OK ") + pinText + " " + kind + " OFF");
       return;
     }
 
@@ -2425,14 +2437,17 @@ void handleIoCommand(const String& cmd) {
     return;
   }
 
-  if (sscanf(cmd.c_str(), "IO.READ %d %15s", &pin, kind) == 2) {
+  if (sscanf(cmd.c_str(), "IO.READ %15s %15s", pinStr, kind) == 2) {
+    pin = analogPinFromString(pinStr);
+
     if (pin < 0 || pin > 255) {
-      enviar(String("IO.ERROR PIN ") + pin);
+      enviar(String("IO.ERROR PIN ") + pinStr);
       return;
     }
 
     int result = readIoLiveValue((uint8_t)pin, kind);
-    enviar(String("IO.STATE ") + pin + " " + kind + " " + result);
+    String pinText = pinToStringForIo((uint8_t)pin, kind);
+    enviar(String("IO.STATE ") + pinText + " " + kind + " " + result);
     return;
   }
 
@@ -2469,7 +2484,8 @@ void tickIoWatch() {
 
   if (value != ioWatchLastValue) {
     ioWatchLastValue = value;
-    enviar(String("IO.STATE ") + ioWatchPin + " " + ioWatchKind + " " + value);
+    String pinText = pinToStringForIo(ioWatchPin, ioWatchKind);
+    enviar(String("IO.STATE ") + pinText + " " + ioWatchKind + " " + value);
   }
 }
 
@@ -2628,19 +2644,21 @@ void handleLine(const char* command, const char* value) {
 
   String cmd = String(command);
   String val = value ? String(value) : "";
+  String fullCmd;
 
   cmd.trim();
   val.trim();
+  fullCmd = val.length() ? (cmd + " " + val) : cmd;
 
   // ===================== IO live wizard =====================
   if (cmd.startsWith("IO.")) {
-    handleIoCommand(cmd);
+    handleIoCommand(fullCmd);
     HRET();
   }
 
   // ===================== MODBUS passthrough =====================
   if (cmd.startsWith("MB.") || cmd.startsWith("MODBUS.")) {
-    handleMbCommand(cmd);
+    handleMbCommand(fullCmd);
     HRET();
   }
 
@@ -3444,6 +3462,39 @@ void handleLine(const char* command, const char* value) {
       potNotchHasCenters[poti]   = true;
 
       enviar("OK NOTCH CAP " +
+              pinToStringForDump((uint8_t)pin,3) +
+              " IDX " + String(k) +
+              " RAW " + String(raw));
+      HRET();
+    }
+
+    if (op.equalsIgnoreCase("CENT")) {
+      int spA = rest.indexOf(' ');
+      int spB = rest.indexOf(' ', spA+1);
+      if (spA < 0 || spB < 0) { enviar(F("ERR NOTCH CENT")); HRET(); }
+
+      String pinStr = rest.substring(0, spA);
+      pinStr.trim();
+      String idxStr = rest.substring(spA+1, spB);
+      idxStr.trim();
+      String rawStr = rest.substring(spB+1);
+      rawStr.trim();
+
+      int pin = analogPinFromString(pinStr.c_str());
+      int poti = getPotIndexByPin((uint8_t)pin);
+      if (poti < 0) { enviar(F("ERR NOTCH CENT pin")); HRET(); }
+
+      int k = idxStr.toInt();
+      if (k < 0 || k >= potNotchCount[poti]) { enviar(F("ERR NOTCH CENT idx")); HRET(); }
+
+      int raw = rawStr.toInt();
+      if (raw < 0) raw = 0;
+      if (raw > 65535) raw = 65535;
+
+      potNotchCenterRaw[poti][k] = (uint16_t)raw;
+      potNotchHasCenters[poti]   = true;
+
+      enviar("OK NOTCH CENT " +
               pinToStringForDump((uint8_t)pin,3) +
               " IDX " + String(k) +
               " RAW " + String(raw));

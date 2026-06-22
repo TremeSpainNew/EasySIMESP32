@@ -41,9 +41,10 @@ Solo disponibles si el firmware se compila con Ethernet.
 |---|---|---|---|
 | `ETH.STATUS` | No | `ETH.STATUS` | estado Ethernet |
 | `ETH.OUT ON/OFF` | No | `ETH.OUT ON` | `OK ETH.OUT ON` |
+| `ETH.MODE DHCP/STATIC` | No | `ETH.MODE DHCP` | guarda el modo y reinicia |
 | `DISCOVER.SETIP <ip>` | No | `DISCOVER.SETIP 192.168.1.50` | `OK SERVER.IP ...` |
 | `ETH.SERVER <ip>` | No | `ETH.SERVER 192.168.1.50` | `OK SERVER.IP ...` |
-| `ETH.SETIP <ip>` | No | `ETH.SETIP 192.168.1.177` | guarda IP y reinicia |
+| `ETH.SETIP <ip>` | No | `ETH.SETIP 192.168.1.177` | guarda IP estática, activa `STATIC` y reinicia |
 
 ## Alta legacy de elementos
 

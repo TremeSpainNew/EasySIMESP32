@@ -2668,7 +2668,9 @@ void handleLine(const char* command, const char* value) {
     IPAddress ip = ETH.localIP();
     bool linkUp  = ETH.linkUp();
     bool hasIp   = (ip != IPAddress((uint32_t)0));
+    bool dhcpConfigured = EE::getDhcpEnabled();
 
+    String configuredMode = dhcpConfigured ? "DHCP" : "STATIC";
     String mode = ethStaticFallbackUsed ? "STATIC" : (hasIp ? "DHCP" : "UNKNOWN");
 
     IPAddress srvIp = serverDiscovery.serverIp();
@@ -2678,6 +2680,8 @@ void handleLine(const char* command, const char* value) {
     s += (ethOutEnabled ? "ON" : "OFF");
     s += " LINK=";
     s += (linkUp ? "UP" : "DOWN");
+    s += " CFG=";
+    s += configuredMode;
     s += " MODE=";
     s += mode;
     s += " IP=";
@@ -2712,6 +2716,49 @@ void handleLine(const char* command, const char* value) {
     }
     HRET();
   }
+
+  if (cmd.startsWith("ETH.MODE")) {
+    String arg = val;
+    if (!arg.length()) {
+      int sp = cmd.indexOf(' ');
+      if (sp > 0) arg = cmd.substring(sp + 1);
+    }
+    arg.trim();
+    arg.toUpperCase();
+
+    if (arg == "DHCP") {
+      EE::setDhcpEnabled(true);
+      EE::commit();
+
+      enviar(F("OK ETH.MODE DHCP"));
+      enviar(F("🔄 Reiniciando para aplicar configuración Ethernet..."));
+
+      delay(500);
+      ESP.restart();
+      HRET();
+    }
+
+    if (arg == "STATIC") {
+      IPAddress savedIp = EE::getStaticIP();
+      if (savedIp == IPAddress(0, 0, 0, 0)) {
+        enviar(F("ERR ETH.MODE STATIC (usa antes ETH.SETIP <ip>)"));
+        HRET();
+      }
+
+      EE::setDhcpEnabled(false);
+      EE::commit();
+
+      enviar(String("OK ETH.MODE STATIC IP=") + savedIp.toString());
+      enviar(F("🔄 Reiniciando para aplicar configuración Ethernet..."));
+
+      delay(500);
+      ESP.restart();
+      HRET();
+    }
+
+    enviar(F("ERR ETH.MODE (usa DHCP|STATIC)"));
+    HRET();
+  }
 #endif
 
   // ===================== DISCOVER / SERVER IP =====================
@@ -2740,14 +2787,14 @@ void handleLine(const char* command, const char* value) {
     val.trim();
     if (val.length() == 0) {
       enviar(F("❌ Uso: ETH.SETIP 192.168.1.100"));
-      return;
+      HRET();
     }
   
     IPAddress newIp;
   
     if (!newIp.fromString(val)) {
       enviar(F("❌ Error: IP no válida. Ejemplo: ETH.SETIP 192.168.1.50"));
-      return;
+      HRET();
     }
   
     EE::setStaticIP(newIp);
@@ -2759,6 +2806,7 @@ void handleLine(const char* command, const char* value) {
   
     delay(500);
     ESP.restart();
+    HRET();
   }
 
     // ===================== Modo CONFIG =====================

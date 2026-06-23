@@ -2511,6 +2511,10 @@ static bool parseCanRef(const char* s, uint8_t& node, uint8_t& channel) {
   return true;
 }
 
+static String canRefToString(uint8_t node, uint8_t channel) {
+  return String("CAN") + String(node) + ":" + String(channel);
+}
+
 static bool saveCanConfig(const String& tipo, uint8_t node, uint8_t channel, const char* param) {
   uint8_t count = EE::read(0);
   if (count >= EEPROM_MAX_ENTRIES) {
@@ -3129,7 +3133,13 @@ void handleLine(const char* command, const char* value) {
 
   // ===================== #DELETEPIN =====================
   if (modoConfig && cmd.startsWith("#DELETEPIN")) {
-    int pinToDelete = analogPinFromString(cmd.c_str() + 10);
+    String pinArg = cmd.substring(10);
+    pinArg.trim();
+
+    uint8_t canNode = 0;
+    uint8_t canChannel = 0;
+    bool deleteCan = parseCanRef(pinArg.c_str(), canNode, canChannel);
+    int pinToDelete = deleteCan ? (int)canChannel : analogPinFromString(pinArg.c_str());
     int count = EE::read(0);
     bool eliminado = false;
     PinConfig deletedCfg{};
@@ -3137,7 +3147,20 @@ void handleLine(const char* command, const char* value) {
     for (int i = 0; i < count; i++) {
       PinConfig cfg;
       EE_GET(1 + i * sizeof(PinConfig), cfg);
-      if ((int)cfg.pin == pinToDelete) {
+      bool matches = false;
+
+      if (deleteCan) {
+        matches =
+          (cfg.type == PIN_TYPE_CAN_BUTTON ||
+           cfg.type == PIN_TYPE_CAN_SWITCH ||
+           cfg.type == PIN_TYPE_CAN_OUTPUT) &&
+          cfg.minIn == canNode &&
+          cfg.pin == canChannel;
+      } else {
+        matches = (int)cfg.pin == pinToDelete;
+      }
+
+      if (matches) {
         deletedCfg = cfg;
 
         for (int j = i; j < count - 1; j++) {
@@ -3158,10 +3181,15 @@ void handleLine(const char* command, const char* value) {
         notchDeleteFromEEPROM((uint8_t)pinToDelete);
       }
 
+      String deletedRef =
+        deleteCan ?
+        canRefToString(canNode, canChannel) :
+        pinToStringForDump((uint8_t)pinToDelete, deletedCfg.type);
+
       enviar(String("🗑️ Configuración eliminada del pin ") +
-            pinToStringForDump((uint8_t)pinToDelete, deletedCfg.type));
+            deletedRef);
       enviar(String("DELETED_PIN ") +
-            pinToStringForDump((uint8_t)pinToDelete, deletedCfg.type));
+            deletedRef);
 
       for (int i=0;i<switchCount;i++){
         if (switches[i]) { delete switches[i]; switches[i]=nullptr; }
@@ -3672,6 +3700,20 @@ void handleLine(const char* command, const char* value) {
       if (cfg.type == 4) {
         int16_t v = (int16_t)lroundf(cfg.minOut);
         enviar(String("SEL.ADD ") + String(cfg.param) + " " + String((int)cfg.pin) + " " + String((int)v));
+        continue;
+      }
+
+      if (cfg.type == PIN_TYPE_CAN_BUTTON ||
+          cfg.type == PIN_TYPE_CAN_SWITCH ||
+          cfg.type == PIN_TYPE_CAN_OUTPUT) {
+        String linea = "ADD ";
+        linea += (cfg.type == PIN_TYPE_CAN_BUTTON ? "BUTTON " :
+                  cfg.type == PIN_TYPE_CAN_SWITCH ? "SWITCH " :
+                  "OUTPUT ");
+        linea += canRefToString((uint8_t)cfg.minIn, cfg.pin);
+        linea += " ";
+        linea += String(cfg.param) + " 0 1";
+        enviar(linea);
         continue;
       }
 

@@ -23,6 +23,13 @@ public:
   using OnApplyFn        = void (*)(const NetCfg& cfg);
   using OnExitFn         = void (*)();
   using StatusProviderFn = String (*)();
+  using TextProviderFn   = String (*)();
+  using OutputCountFn    = uint8_t (*)();
+  using OutputLabelFn    = String (*)(uint8_t index);
+  using OutputStateFn    = int (*)(uint8_t index);
+  using OutputSetFn      = void (*)(uint8_t index, bool on);
+  using ToggleBoolFn     = bool (*)();
+  using SetBoolFn        = void (*)(bool enabled);
 
   // NUEVO: Tools callbacks
   using OnToolFn = void (*)();
@@ -57,6 +64,15 @@ public:
   void setOnApply(OnApplyFn fn) { onApply_ = fn; }
   void setOnExit(OnExitFn fn)   { onExit_  = fn; }
   void setStatusProvider(StatusProviderFn fn) { statusProvider_ = fn; }
+  void setEthStatusProvider(TextProviderFn fn) { ethStatusProvider_ = fn; }
+  void setCanStatusProvider(TextProviderFn fn) { canStatusProvider_ = fn; }
+  void setIoStatusProvider(TextProviderFn fn)  { ioStatusProvider_  = fn; }
+  void setOutputCountProvider(OutputCountFn fn) { outputCountProvider_ = fn; }
+  void setOutputLabelProvider(OutputLabelFn fn) { outputLabelProvider_ = fn; }
+  void setOutputStateProvider(OutputStateFn fn) { outputStateProvider_ = fn; }
+  void setOutputSetFn(OutputSetFn fn) { outputSetFn_ = fn; }
+  void setAllOutInvGetter(ToggleBoolFn fn) { allOutInvGetter_ = fn; }
+  void setAllOutInvSetter(SetBoolFn fn) { allOutInvSetter_ = fn; }
 
   // NUEVO: Tools hooks
   void setOnToolDump(OnToolFn fn)    { onToolDump_ = fn; }
@@ -65,7 +81,16 @@ public:
 
 private:
   // ========= Pages =========
-  enum Page : uint8_t { PAGE_STATUS=0, PAGE_NET=1, PAGE_TOOLS=2 };
+  enum Page : uint8_t {
+    PAGE_STATUS=0,
+    PAGE_NET=1,
+    PAGE_ETH=2,
+    PAGE_CAN=3,
+    PAGE_IO=4,
+    PAGE_OUTTEST=5,
+    PAGE_OUTINV=6,
+    PAGE_TOOLS=7
+  };
   enum NetSub : uint8_t { NET_SUB_0=0, NET_SUB_1=1 };
   enum NetField : uint8_t { F_MODE=0, F_IP=1, F_GW=2, F_MASK=3, F_APPLY=4, F_BACK=5 };
 
@@ -81,10 +106,16 @@ private:
   // ========= UI =========
   void handleStatus(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack);
   void handleNet(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack);
+  void handleInfoPage(Page page, bool evOk, bool evBack);
+  void handleOutputTest(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack);
+  void handleOutInv(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack);
   void handleTools(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack);
 
   void drawStatus();
   void drawNet();
+  void drawInfoPage(const char* title, TextProviderFn provider, const char* footer);
+  void drawOutputTest();
+  void drawOutInv();
   void drawTools();
 
   void drawHeader(const char* title);
@@ -103,6 +134,7 @@ private:
   // ========= Keys =========
   void readKeys(bool& evUp, bool& evDown, bool& evLeft, bool& evRight, bool& evOk, bool& evBack);
   bool keyPressedFromRaw(uint8_t raw, uint8_t idx) const;
+  void syncKeysFromCurrentRead();
 
   // ========= IP draw helper =========
   void drawIp4(int x, int yBase, const uint8_t a[4], bool editing, uint8_t activeOctet);
@@ -120,7 +152,8 @@ private:
   bool g_confirmYes    = false;
 
   // STATUS menu
-  uint8_t statusSel_ = 0; // 0=NETWORK,1=TOOLS,2=EXIT
+  uint8_t statusSel_ = 0;
+  uint8_t outputSel_ = 0;
 
   // NET
   NetCfg cfg_;
@@ -131,6 +164,7 @@ private:
 
   // TOOLS
   uint8_t toolsSel_ = 0;
+  uint8_t outInvSel_ = 0;
 
   // Draw flag
   bool dirty_ = true;
@@ -139,6 +173,15 @@ private:
   OnApplyFn onApply_ = nullptr;
   OnExitFn onExit_ = nullptr;
   StatusProviderFn statusProvider_ = nullptr;
+  TextProviderFn ethStatusProvider_ = nullptr;
+  TextProviderFn canStatusProvider_ = nullptr;
+  TextProviderFn ioStatusProvider_ = nullptr;
+  OutputCountFn outputCountProvider_ = nullptr;
+  OutputLabelFn outputLabelProvider_ = nullptr;
+  OutputStateFn outputStateProvider_ = nullptr;
+  OutputSetFn outputSetFn_ = nullptr;
+  ToggleBoolFn allOutInvGetter_ = nullptr;
+  SetBoolFn allOutInvSetter_ = nullptr;
 
   // Tools callbacks
   OnToolFn onToolDump_ = nullptr;

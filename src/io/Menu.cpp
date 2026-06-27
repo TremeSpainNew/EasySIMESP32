@@ -11,8 +11,12 @@ Menu::Menu(U8G2& d) : d_(d) {}
 void Menu::begin() {
   active_ = false;
   page_ = PAGE_STATUS;
+  g_confirmReboot = false;
+  g_confirmYes = false;
 
   statusSel_ = 0;
+  outputSel_ = 0;
+  outInvSel_ = 0;
 
   netSub_ = NET_SUB_0;
   netField_ = F_MODE;
@@ -30,12 +34,19 @@ void Menu::open() {
   active_ = true;
   page_ = PAGE_STATUS;
   statusSel_ = 0;
+  outputSel_ = 0;
+  outInvSel_ = 0;
   editing_ = false;
+  g_confirmReboot = false;
+  g_confirmYes = false;
+  syncKeysFromCurrentRead();
   dirty_ = true;
 }
 
 void Menu::close() {
   active_ = false;
+  g_confirmReboot = false;
+  g_confirmYes = false;
   dirty_ = true;
   if (onExit_) onExit_();
 }
@@ -74,6 +85,22 @@ void Menu::beginPCF(TwoWire& wire, uint8_t addr,
   pcfOwned_ = PCF8574(pcfAddr_, &wire);
   pcfOwned_.begin();
   beginPCF(pcfOwned_, up, down, left, right, ok, back, activeLow);
+}
+
+void Menu::syncKeysFromCurrentRead() {
+  if (!pcfEnabled_ || !pcfExternal_) return;
+
+  uint8_t raw = pcfExternal_->read8();
+  lastRaw_ = raw;
+  unsigned long now = millis();
+
+  for (int i = 0; i < 6; i++) {
+    bool pressed = keyPressedFromRaw(raw, i);
+    keys_[i].stable = pressed;
+    keys_[i].lastChangeMs = now;
+    keys_[i].pressedMs = now;
+    keys_[i].lastRepeatMs = now;
+  }
 }
 
 // ---------------- data ----------------
@@ -253,17 +280,17 @@ void Menu::readKeys(bool& evUp, bool& evDown, bool& evLeft, bool& evRight, bool&
 void Menu::tick() {
   if (!active_) return;
 
-  // --------- Confirmación de reboot (sin PAGE_CONFIRM) ----------
-  // Estado oculto dentro de tick: se muestra cuando se entra en Tools->Reboot
-  static bool confirmReboot = false;
-  static bool confirmYes = false;
-
   bool up,down,left,right,ok,back;
   readKeys(up,down,left,right,ok,back);
 
   switch(page_) {
     case PAGE_STATUS: handleStatus(up,down,left,right,ok,back); break;
     case PAGE_NET:    handleNet(up,down,left,right,ok,back); break;
+    case PAGE_ETH:
+    case PAGE_CAN:
+    case PAGE_IO:     handleInfoPage(page_, ok, back); break;
+    case PAGE_OUTTEST:handleOutputTest(up,down,left,right,ok,back); break;
+    case PAGE_OUTINV: handleOutInv(up,down,left,right,ok,back); break;
     case PAGE_TOOLS:  handleTools(up,down,left,right,ok,back); break;
   }
 
@@ -272,19 +299,21 @@ void Menu::tick() {
     switch(page_) {
       case PAGE_STATUS: drawStatus(); break;
       case PAGE_NET:    drawNet(); break;
+      case PAGE_ETH:    drawInfoPage("ETH STATUS", ethStatusProvider_, "OK=RET"); break;
+      case PAGE_CAN:    drawInfoPage("CAN STATUS", canStatusProvider_, "OK=RET"); break;
+      case PAGE_IO:     drawInfoPage("IO STATUS",  ioStatusProvider_,  "OK=RET"); break;
+      case PAGE_OUTTEST:drawOutputTest(); break;
+      case PAGE_OUTINV: drawOutInv(); break;
       case PAGE_TOOLS:  drawTools(); break;
     }
   }
 
-  // Hook: si handleTools ha pedido confirmación (lo marcamos con toolsSel_==2 + ok)
-  // (lo hacemos aquí con una marca estática, para no tocar el header)
-  // Nota: el “disparo” real está en handleTools: ahí activamos confirmReboot.
 }
 
 // ---------------- handlers ----------------
 void Menu::handleStatus(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack) {
   (void)evLeft; (void)evRight;
-  const uint8_t N = 3; // NETWORK, TOOLS, EXIT
+  const uint8_t N = 8; // NETWORK, ETH, CAN, IO, TEST, OUTINV, TOOLS, EXIT
 
   if (evUp)   { statusSel_ = (statusSel_==0) ? (N-1) : (statusSel_-1); dirty_ = true; }
   if (evDown) { statusSel_ = (statusSel_+1>=N) ? 0 : (statusSel_+1); dirty_ = true; }
@@ -292,10 +321,25 @@ void Menu::handleStatus(bool evUp, bool evDown, bool evLeft, bool evRight, bool 
   if (evBack) { close(); return; }
 
   if (evOk) {
-    if (statusSel_ == 0) { page_ = PAGE_NET;  netSetSub(NET_SUB_0); dirty_ = true; return; }
-    if (statusSel_ == 1) { page_ = PAGE_TOOLS; toolsSel_ = 0;       dirty_ = true; return; }
-    close();
+    switch (statusSel_) {
+      case 0: page_ = PAGE_NET; netSetSub(NET_SUB_0); dirty_ = true; return;
+      case 1: page_ = PAGE_ETH; dirty_ = true; return;
+      case 2: page_ = PAGE_CAN; dirty_ = true; return;
+      case 3: page_ = PAGE_IO; dirty_ = true; return;
+      case 4: page_ = PAGE_OUTTEST; outputSel_ = 0; dirty_ = true; return;
+      case 5: page_ = PAGE_OUTINV; outInvSel_ = allOutInvGetter_ && allOutInvGetter_() ? 1 : 0; dirty_ = true; return;
+      case 6: page_ = PAGE_TOOLS; toolsSel_ = 0; dirty_ = true; return;
+      default: close(); return;
+    }
   }
+}
+
+void Menu::handleInfoPage(Page page, bool evOk, bool evBack) {
+  (void)page;
+  if (evOk || evBack) {
+    page_ = PAGE_STATUS;
+  }
+  dirty_ = true;
 }
 
 void Menu::handleNet(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack) {
@@ -310,13 +354,21 @@ void Menu::handleNet(bool evUp, bool evDown, bool evLeft, bool evRight, bool evO
     return;
   }
 
-  // Si estamos editando octetos, LEFT/RIGHT mueve octeto, UP/DOWN cambia valor, OK avanza octeto
+  // Si estamos editando octetos, LEFT/RIGHT mueve octeto, UP/DOWN cambia valor.
+  // OK avanza y, al llegar al ultimo octeto, sale de la fila para seguir navegando.
   if (editing_ && isIpField(netField_)) {
     uint8_t* arr = (netField_==F_IP) ? cfg_.ip : (netField_==F_GW) ? cfg_.gw : cfg_.mask;
 
     if (evLeft)  { if (octet_ > 0) octet_--; dirty_ = true; }
     if (evRight) { if (octet_ < 3) octet_++; dirty_ = true; }
-    if (evOk)    { octet_ = (octet_ < 3) ? (octet_ + 1) : 0; dirty_ = true; }
+    if (evOk) {
+      if (octet_ < 3) octet_++;
+      else {
+        editing_ = false;
+        octet_ = 0;
+      }
+      dirty_ = true;
+    }
 
     if (evUp)    { arr[octet_] = incWrap(arr[octet_], +1); dirty_ = true; }
     if (evDown)  { arr[octet_] = incWrap(arr[octet_], -1); dirty_ = true; }
@@ -369,8 +421,10 @@ void Menu::handleNet(bool evUp, bool evDown, bool evLeft, bool evRight, bool evO
       d_.setFont(u8g2_font_5x8_tf);
       d_.drawStr(0, 12, "APPLY...");
       d_.drawStr(0, 24, cfg_.dhcp ? "MODE: DHCP" : "MODE: STATIC");
-      d_.drawStr(0, 40, "BACK para salir");
+      d_.drawStr(0, 40, "Volviendo al menu");
       d_.sendBuffer();
+      page_ = PAGE_STATUS;
+      dirty_ = true;
     }
     return;
   }
@@ -388,6 +442,34 @@ void Menu::handleTools(bool evUp, bool evDown, bool evLeft, bool evRight, bool e
   (void)evLeft; (void)evRight;
   const uint8_t N = 4; // DUMP, SCAN, REBOOT, BACK
 
+  if (g_confirmReboot) {
+    if (evUp || evDown) {
+      g_confirmYes = !g_confirmYes;
+      dirty_ = true;
+    }
+
+    if (evBack) {
+      g_confirmReboot = false;
+      g_confirmYes = false;
+      dirty_ = true;
+      return;
+    }
+
+    if (evOk) {
+      bool shouldReboot = g_confirmYes;
+      g_confirmReboot = false;
+      g_confirmYes = false;
+      dirty_ = true;
+
+      if (shouldReboot && onToolReboot_) {
+        onToolReboot_();
+      }
+      return;
+    }
+
+    return;
+  }
+
   if (evUp)   { toolsSel_ = (toolsSel_==0) ? (N-1) : (toolsSel_-1); dirty_ = true; }
   if (evDown) { toolsSel_ = (toolsSel_+1>=N) ? 0 : (toolsSel_+1); dirty_ = true; }
 
@@ -398,46 +480,9 @@ void Menu::handleTools(bool evUp, bool evDown, bool evLeft, bool evRight, bool e
     if (toolsSel_ == 1) { if (onToolScanI2C_) onToolScanI2C_(); return; }
 
     if (toolsSel_ == 2) {
-      // Activa confirmación (sin tocar header: usamos estáticos dentro de tick)
-      // Truco: forzamos un “repaint” y activamos el flag estático vía función local
-      //extern void __menu_confirm_reboot_set(bool);
-      if (onToolReboot_) onToolReboot_();
-      return;
-      // No existe: así que lo hacemos con static dentro de tick usando una señal:
-      // -> usaremos un patrón simple: ponemos page_ temporal y tick lo detecta NO. (mejor)
-      // Solución segura: dibujamos confirm aquí y activamos un static local vía lambda.
-      // Como no podemos compartir static de tick, lo hacemos al revés: redibujamos confirm desde aquí
-      // y dejamos en tick un flag estático accesible por referencia (C++ no permite).
-      //
-      // En vez de inventos, hacemos la confirmación aquí mismo, bloqueando el menú:
-      d_.clearBuffer();
-      drawHeader("CONFIRM");
-      d_.setFont(u8g2_font_5x8_tf);
-      d_.drawStr(0, 24, "REBOOT?");
-
-      d_.drawStr(12, 40, "NO");
-      d_.drawStr(12, 52, "YES");
-      d_.drawStr(0, 40, ">"); // NO por defecto
-      d_.drawStr(0, 62, "OK=YES  BACK=NO");
-      d_.sendBuffer();
-
-      // Espera "modal" NO BLOQUEANTE: en vez de while, cambiamos a una “subfase”
-      // usando variables estáticas dentro de esta función.
       g_confirmReboot = true;
       g_confirmYes = false;
-      toolsSel_ = 255;
       dirty_ = true;
-      return;
-
-      // Guardamos en “dirty_” y en un flag global (estático en TU) dentro de tick.
-      // -> Para no romper, hacemos la confirmación REAL en drawTools con una marca:
-      // Marcamos toolsSel_ = 255 para “modo confirm”
-      toolsSel_ = 255;
-      dirty_ = true;
-
-      // Guardamos en estáticos accesibles por la misma función usando tick() no. (no se puede)
-      // => Implementación limpia: usamos toolsSel_==255 como confirm y lo resolvemos en handleTools
-      // en próximas llamadas.
       return;
     }
 
@@ -445,30 +490,94 @@ void Menu::handleTools(bool evUp, bool evDown, bool evLeft, bool evRight, bool e
     page_ = PAGE_STATUS;
     dirty_ = true;
   }
+}
 
-  // Resolver modo confirm si toolsSel_==255 (confirmación de reboot)
-  // Nota: este bloque también debe ejecutar con inputs, así que lo dejamos aquí:
-  if (toolsSel_ == 255) {
-    // En este modo, UP/DOWN alterna, OK confirma, BACK cancela
-    static bool yes = false;
+void Menu::handleOutputTest(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack) {
+  uint8_t count = outputCountProvider_ ? outputCountProvider_() : 0;
+  uint8_t itemCount = count + 1; // salidas + BACK
+  if (evBack) {
+    page_ = PAGE_STATUS;
+    dirty_ = true;
+    return;
+  }
 
-    if (evUp || evDown) { yes = !yes; dirty_ = true; }
-
-    if (evBack) {
-      toolsSel_ = 2; // vuelve a REBOOT item seleccionado
-      dirty_ = true;
-      return;
-    }
-
+  if (count == 0) {
     if (evOk) {
-      if (yes) {
-        if (onToolReboot_) onToolReboot_();
+      page_ = PAGE_STATUS;
+    }
+    dirty_ = true;
+    return;
+  }
+
+  if (outputSel_ >= itemCount) outputSel_ = itemCount - 1;
+
+  if (evUp) {
+    outputSel_ = (outputSel_ == 0) ? (itemCount - 1) : (outputSel_ - 1);
+    dirty_ = true;
+  }
+  if (evDown) {
+    outputSel_ = (outputSel_ + 1 >= itemCount) ? 0 : (outputSel_ + 1);
+    dirty_ = true;
+  }
+
+  if (outputSel_ == count) {
+    if (evOk) {
+      page_ = PAGE_STATUS;
+    }
+    dirty_ = true;
+    return;
+  }
+
+  int cur = outputStateProvider_ ? outputStateProvider_(outputSel_) : 0;
+  bool state = cur > 0;
+
+  if (evLeft && outputSetFn_) {
+    outputSetFn_(outputSel_, false);
+    dirty_ = true;
+  }
+  if (evRight && outputSetFn_) {
+    outputSetFn_(outputSel_, true);
+    dirty_ = true;
+  }
+  if (evOk && outputSetFn_) {
+    outputSetFn_(outputSel_, !state);
+    dirty_ = true;
+  }
+
+  dirty_ = true;
+}
+
+void Menu::handleOutInv(bool evUp, bool evDown, bool evLeft, bool evRight, bool evOk, bool evBack) {
+  if (evBack) {
+    page_ = PAGE_STATUS;
+    dirty_ = true;
+    return;
+  }
+
+  bool cur = allOutInvGetter_ ? allOutInvGetter_() : false;
+  const uint8_t N = 3; // OFF, ON, BACK
+
+  if (evUp) {
+    outInvSel_ = (outInvSel_ == 0) ? (N - 1) : (outInvSel_ - 1);
+  }
+  if (evDown) {
+    outInvSel_ = (outInvSel_ + 1 >= N) ? 0 : (outInvSel_ + 1);
+  }
+  if (evLeft) outInvSel_ = 0;
+  if (evRight) outInvSel_ = 1;
+
+  if (evOk) {
+    if (outInvSel_ == 2) {
+      page_ = PAGE_STATUS;
+    } else {
+      bool next = outInvSel_ == 1;
+      if (next != cur && allOutInvSetter_) {
+        allOutInvSetter_(next);
       }
-      toolsSel_ = 2;
-      dirty_ = true;
-      return;
     }
   }
+
+  dirty_ = true;
 }
 
 // ---------------- drawing ----------------
@@ -509,13 +618,28 @@ void Menu::drawStatus() {
   drawHeader("MENU");
   d_.setFont(u8g2_font_5x8_tf);
 
-  const int y1 = 22, y2 = 34, y3 = 46;
+  const char* items[] = {
+    "NETWORK",
+    "ETH STATUS",
+    "CAN STATUS",
+    "IO STATUS",
+    "TEST OUTPUTS",
+    "OUTINV ALL",
+    "TOOLS",
+    "EXIT"
+  };
+  const uint8_t itemCount = sizeof(items) / sizeof(items[0]);
+  uint8_t top = 0;
+  if (statusSel_ > 2) top = statusSel_ - 2;
+  if (top + 4 > itemCount) top = itemCount - 4;
 
-  d_.drawStr(0, (statusSel_==0)?y1:(statusSel_==1)?y2:y3, ">");
-
-  d_.drawStr(12, y1, "NETWORK");
-  d_.drawStr(12, y2, "TOOLS");
-  d_.drawStr(12, y3, "GPIO");
+  for (uint8_t row = 0; row < 4; row++) {
+    uint8_t idx = top + row;
+    int y = 22 + row * 10;
+    if (idx >= itemCount) break;
+    if (statusSel_ == idx) d_.drawStr(0, y, ">");
+    d_.drawStr(12, y, items[idx]);
+  }
 
   if (statusProvider_) {
     String s = statusProvider_();
@@ -526,9 +650,96 @@ void Menu::drawStatus() {
       d_.drawStr(0, 62, ln.c_str());
     }
   } else {
-    d_.drawStr(0, 62, "OK=SEL  BACK=EXIT");
+    d_.drawStr(0, 62, "OK=SEL");
   }
 
+  d_.sendBuffer();
+}
+
+void Menu::drawInfoPage(const char* title, TextProviderFn provider, const char* footer) {
+  d_.clearBuffer();
+  drawHeader(title);
+  d_.setFont(u8g2_font_5x8_tf);
+
+  String content = provider ? provider() : String("No data");
+  int start = 0;
+  int row = 0;
+  while (start < (int)content.length() && row < 4) {
+    int nl = content.indexOf('\n', start);
+    String line = (nl >= 0) ? content.substring(start, nl) : content.substring(start);
+    if (line.length() > 21) line = line.substring(0, 21);
+    d_.drawStr(0, 22 + row * 10, line.c_str());
+    row++;
+    if (nl < 0) break;
+    start = nl + 1;
+  }
+
+  d_.drawStr(0, 62, footer);
+  d_.sendBuffer();
+}
+
+void Menu::drawOutputTest() {
+  d_.clearBuffer();
+  drawHeader("TEST OUTPUTS");
+  d_.setFont(u8g2_font_5x8_tf);
+
+  uint8_t count = outputCountProvider_ ? outputCountProvider_() : 0;
+  if (count == 0) {
+    d_.drawStr(0, 24, "No hay salidas");
+    d_.drawStr(0, 62, "OK=RET");
+    d_.sendBuffer();
+    return;
+  }
+
+  uint8_t itemCount = count + 1;
+  if (outputSel_ >= itemCount) outputSel_ = itemCount - 1;
+  uint8_t top = 0;
+  if (itemCount > 3) {
+    if (outputSel_ > 1) top = outputSel_ - 1;
+    if (top + 3 > itemCount) top = itemCount - 3;
+  }
+
+  for (uint8_t row = 0; row < 3; row++) {
+    uint8_t idx = top + row;
+    if (idx >= itemCount) break;
+
+    int y = 22 + row * 12;
+    if (outputSel_ == idx) d_.drawStr(0, y, ">");
+
+    if (idx == count) {
+      d_.drawStr(10, y, "BACK");
+      continue;
+    }
+
+    String label = outputLabelProvider_ ? outputLabelProvider_(idx) : String("OUT");
+    int state = outputStateProvider_ ? outputStateProvider_(idx) : 0;
+    if (label.length() > 15) label = label.substring(0, 15);
+    d_.drawStr(10, y, label.c_str());
+    d_.drawStr(102, y, state > 0 ? "ON" : "OFF");
+  }
+
+  d_.drawStr(0, 62, "UP/DN SEL  OK=RUN");
+  d_.sendBuffer();
+}
+
+void Menu::drawOutInv() {
+  d_.clearBuffer();
+  drawHeader("OUTINV ALL");
+  d_.setFont(u8g2_font_5x8_tf);
+
+  bool enabled = allOutInvGetter_ ? allOutInvGetter_() : false;
+  const char* items[] = { "OFF", "ON", "BACK" };
+
+  d_.drawStr(0, 20, "Estado actual:");
+  d_.drawStr(78, 20, enabled ? "ON" : "OFF");
+
+  for (uint8_t i = 0; i < 3; i++) {
+    int y = 34 + i * 10;
+    if (outInvSel_ == i) d_.drawStr(0, y, ">");
+    d_.drawStr(12, y, items[i]);
+  }
+
+  d_.drawStr(0, 62, "L/R AJUSTA  OK=SEL");
   d_.sendBuffer();
 }
 
@@ -562,7 +773,7 @@ void Menu::drawNet() {
       d_.drawStr(0, y3, "DHCP: sin IP manual");
     }
 
-    d_.drawStr(0, 62, editing_ ? "UP/DN=VAL L/R=OCT OK=NEXT" : "OK=EDIT  L/R=PAGE  BACK=EXIT");
+    d_.drawStr(0, 62, editing_ ? "UP/DN=VAL L/R=OCT OK=NEXT/OUT" : "OK=EDIT  L/R=PAGE");
   } else {
     int n = netFieldCount(netSub_);
     const int ys[3] = {y1,y2,y3};
@@ -582,17 +793,14 @@ void Menu::drawNet() {
       }
     }
 
-    d_.drawStr(0, 62, editing_ ? "UP/DN=VAL L/R=OCT OK=NEXT" : "OK=SEL  L/R=PAGE  BACK=EXIT");
+    d_.drawStr(0, 62, editing_ ? "UP/DN=VAL L/R=OCT OK=NEXT/OUT" : "OK=SEL  L/R=PAGE");
   }
 
   d_.sendBuffer();
 }
 
 void Menu::drawTools() {
-  // Si estamos en confirmación (toolsSel_==255)
-  static bool yes = false;
-
-  if (toolsSel_ == 255) {
+  if (g_confirmReboot) {
     d_.clearBuffer();
     drawHeader("CONFIRM");
     d_.setFont(u8g2_font_5x8_tf);
@@ -600,9 +808,9 @@ void Menu::drawTools() {
     d_.drawStr(0, 24, "REBOOT?");
     d_.drawStr(12, 40, "NO");
     d_.drawStr(12, 52, "YES");
-    d_.drawStr(0, yes ? 52 : 40, ">");
+    d_.drawStr(0, g_confirmYes ? 52 : 40, ">");
 
-    d_.drawStr(0, 62, "OK=SEL  BACK=NO");
+    d_.drawStr(0, 62, "OK=SEL");
     d_.sendBuffer();
     return;
   }
@@ -619,6 +827,6 @@ void Menu::drawTools() {
     d_.drawStr(12, y, items[i]);
   }
 
-  d_.drawStr(0, 62, "OK=RUN  BACK=RET");
+  d_.drawStr(0, 62, "OK=RUN");
   d_.sendBuffer();
 }

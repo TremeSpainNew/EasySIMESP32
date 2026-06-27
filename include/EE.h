@@ -1,4 +1,5 @@
 #pragma once
+#include <Arduino.h>
 #include <Preferences.h>
 
 namespace EE {
@@ -12,6 +13,10 @@ namespace EE {
   void    put(uint32_t addr, const void* src, size_t len);
   void setStaticIP(IPAddress ip);
   IPAddress getStaticIP();
+  void setStaticGateway(IPAddress ip);
+  IPAddress getStaticGateway();
+  void setStaticMask(IPAddress ip);
+  IPAddress getStaticMask();
   void setDhcpEnabled(bool enabled);
   bool getDhcpEnabled();
   // utilidades

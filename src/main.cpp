@@ -15,7 +15,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <ctype.h>
 #include "nvs_flash.h"
-//#include <io/Menu.h>
+#include <io/Menu.h>
 #include <ElegantOTA.h>      // NUEVO: ElegantOTA para actualizaciones vía web
 #include <math.h>               // isnan, fabs, lroundf
 #include <Adafruit_ADS1X15.h>   // ADS1115<<
@@ -32,10 +32,10 @@
 #define PIN_TYPE_CAN_SWITCH 6
 #define PIN_TYPE_CAN_OUTPUT 7
 
-//#include <PCF8574.h>
+#include <PCF8574.h>
 
-#define SSD1306
-//#define SSD1309
+//#define SSD1306
+#define SSD1309
 
 #if defined(SSD1306)
   #include <Adafruit_GFX.h>
@@ -84,6 +84,8 @@ void handleMbCommand(const String& cmd);
 void handleAPButton();
 void enableAP();
 void disableAP();
+static bool parseCanRef(const char* s, uint8_t& node, uint8_t& channel);
+static String canRefToString(uint8_t node, uint8_t channel);
 
 // ======================= SPI/I2C comunes =======================
 SPIClass SPIBUS(HSPI);
@@ -186,6 +188,20 @@ const char* potParams[EEPROM_MAX_ENTRIES];
 uint8_t switchPinNum[EEPROM_MAX_ENTRIES];
 uint8_t buttonPinNum[EEPROM_MAX_ENTRIES];
 uint8_t outputPinNum[EEPROM_MAX_ENTRIES];
+bool outputInvertedFlags[EEPROM_MAX_ENTRIES];
+
+static bool g_can_started = false;
+static bool g_can_seen_hello = false;
+static bool g_can_seen_heartbeat = false;
+static bool g_can_seen_ack = false;
+static uint8_t g_can_last_hello_node = 0;
+static uint8_t g_can_last_hb_node = 0;
+static uint8_t g_can_last_ack_node = 0;
+static uint8_t g_can_last_ack_channel = 0;
+static uint8_t g_can_last_ack_value = 0;
+static unsigned long g_can_last_hello_ms = 0;
+static unsigned long g_can_last_hb_ms = 0;
+static unsigned long g_can_last_ack_ms = 0;
 
 bool ioWatchEnabled = false;
 uint8_t ioWatchPin = 0;
@@ -236,12 +252,12 @@ ServerDiscovery serverDiscovery(5091,5090); // la clase hace discover UDP+TCP 50
   Adafruit_SSD1306 display(OLED_W, OLED_H, &I2CBUS1, OLED_RESET);
 #elif defined(SSD1309)
   U8G2_SSD1309_128X64_NONAME2_F_SW_I2C display(U8G2_R0, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA, /* reset=*/ U8X8_PIN_NONE);
+  Menu menu(display);
+  PCF8574 pcf(0x38, &Wire);
 #endif
 //U8G2_SSD1306_128X64_NONAME_F_SW_I2C display(U8G2_R0, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA, /* reset=*/ U8X8_PIN_NONE);
 //U8G2_SSD1309_128X64_NONAME2_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 //Adafruit_SH1106G display(128, 64, &Wire, -1);
-//Menu menu(display);
-//PCF8574 pcf(0x38); // para el menú
 
 static bool oledOK = false;
 static unsigned long lastOledMs = 0;
@@ -252,6 +268,12 @@ static volatile bool oledPending = true;   // true al arranque para dibujar 1ª 
 static String oledLastFrame;
 static unsigned long lastPotsMs = 0;
 static const unsigned long POTS_PERIOD_MS = 20;
+static bool menuPcfReady = false;
+
+#if defined(SSD1309)
+static constexpr uint8_t MENU_PCF_PIN_ENT = 4;
+static constexpr unsigned long MENU_ENTER_HOLD_MS = 5000;
+#endif
 
 static inline void oledRequest() {
   oledPending = true;
@@ -497,6 +519,79 @@ static void scanBus(TwoWire &bus, const char* name) {
 }
 
 #if defined(SSD1309)
+static String menuStatusProvider() {
+  bool linkUp = ETH.linkUp();
+  IPAddress ip = ETH.localIP();
+  if (!linkUp) return "ETH DOWN";
+  if (ip == IPAddress((uint32_t)0)) return "IP 0.0.0.0";
+  return String("IP ") + ip.toString();
+}
+
+static void menuApplyNet(const Menu::NetCfg& cfg) {
+  IPAddress ip(cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]);
+  IPAddress gw(cfg.gw[0], cfg.gw[1], cfg.gw[2], cfg.gw[3]);
+  IPAddress mask(cfg.mask[0], cfg.mask[1], cfg.mask[2], cfg.mask[3]);
+
+  EE::setDhcpEnabled(cfg.dhcp);
+  EE::setStaticIP(ip);
+  EE::setStaticGateway(gw);
+  EE::setStaticMask(mask);
+  EE::commit();
+
+  Serial.printf("📡 MENU NET APPLY mode=%s ip=%s gw=%s mask=%s\n",
+                cfg.dhcp ? "DHCP" : "STATIC",
+                ip.toString().c_str(),
+                gw.toString().c_str(),
+                mask.toString().c_str());
+  Serial.println("🔄 Reiniciando para aplicar configuración de red...");
+  delay(300);
+  ESP.restart();
+}
+
+static void menuToolDump() {
+  handleLine("#DUMP", "");
+}
+
+static void menuToolScanI2C() {
+  scanBus(Wire, "MAIN");
+  scanBus(I2CBUS1, "OLED");
+}
+
+static void menuClosed() {
+  oledRequest();
+}
+
+static void pollMenuEnterHold() {
+  if (!menuPcfReady || menu.isActive()) return;
+
+  static bool holdConsumed = false;
+  static unsigned long pressedSinceMs = 0;
+
+  uint8_t raw = pcf.read8();
+  bool entPressed = (raw & (1u << MENU_PCF_PIN_ENT)) == 0;
+  unsigned long now = millis();
+
+  if (!entPressed) {
+    pressedSinceMs = 0;
+    holdConsumed = false;
+    return;
+  }
+
+  if (holdConsumed) return;
+
+  if (pressedSinceMs == 0) {
+    pressedSinceMs = now;
+    return;
+  }
+
+  if ((now - pressedSinceMs) >= MENU_ENTER_HOLD_MS) {
+    holdConsumed = true;
+    menu.open();
+    oledRequest();
+    Serial.println("✅ Menu abierto por pulsacion larga ENT");
+  }
+}
+
 static void oledDrawNetPage_U8G2(const String& frame) {
   display.clearBuffer();
   display.setFont(u8g2_font_5x8_tf);
@@ -830,6 +925,251 @@ static bool parseValueToInt(const String& v, int &out) {
   return true;
 }
 
+static inline bool isOutputConfigType(uint8_t type) {
+  return type == 2 || type == PIN_TYPE_CAN_OUTPUT;
+}
+
+static inline bool pinConfigOutputInverted(const PinConfig& cfg) {
+  return isOutputConfigType(cfg.type) && cfg.intervalo != 0;
+}
+
+static inline void pinConfigSetOutputInverted(PinConfig& cfg, bool inverted) {
+  if (isOutputConfigType(cfg.type)) {
+    cfg.intervalo = inverted ? 1 : 0;
+  }
+}
+
+static inline int logicalToPhysicalOutputValue(int logicalValue, bool inverted) {
+  int value = logicalValue ? 1 : 0;
+  return inverted ? (1 - value) : value;
+}
+
+static inline int physicalToLogicalOutputValue(int physicalValue, bool inverted) {
+  int value = physicalValue ? 1 : 0;
+  return inverted ? (1 - value) : value;
+}
+
+static int getLocalOutputIndexByPin(uint8_t pin) {
+  for (int i = 0; i < outputCount; i++) {
+    if (outputPinNum[i] == pin) return i;
+  }
+  return -1;
+}
+
+static bool writeLocalOutputByIndex(int index, int logicalValue) {
+  if (index < 0 || index >= outputCount) return false;
+
+  IOPin* pin = outputPins[index];
+  if (!pin) return false;
+
+  pin->pinMode(OUTPUT);
+
+  int physicalValue = logicalToPhysicalOutputValue(
+    logicalValue,
+    outputInvertedFlags[index]
+  );
+
+  pin->digitalWrite(physicalValue ? HIGH : LOW);
+  return true;
+}
+
+static bool writeLocalOutputByName(const char* name, int logicalValue) {
+  if (!name || !name[0]) return false;
+
+  for (int i = 0; i < outputCount; i++) {
+    if (outputParams[i] && strcasecmp(outputParams[i], name) == 0) {
+      return writeLocalOutputByIndex(i, logicalValue);
+    }
+  }
+
+  return false;
+}
+
+static bool applyLocalOutputInversionByPin(uint8_t pin, bool inverted) {
+  int index = getLocalOutputIndexByPin(pin);
+  if (index < 0 || !outputPins[index]) return false;
+
+  int oldPhysical = outputPins[index]->digitalRead() == HIGH ? 1 : 0;
+  int logicalValue = physicalToLogicalOutputValue(oldPhysical, outputInvertedFlags[index]);
+
+  outputInvertedFlags[index] = inverted;
+  writeLocalOutputByIndex(index, logicalValue);
+  return true;
+}
+
+static bool areAllOutputsInverted() {
+  uint8_t count = EE::read(0);
+  bool found = false;
+
+  for (int i = 0; i < count && i < EEPROM_MAX_ENTRIES; i++) {
+    PinConfig cfg{};
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+    if (!isOutputConfigType(cfg.type)) continue;
+    found = true;
+    if (!pinConfigOutputInverted(cfg)) return false;
+  }
+
+  return found;
+}
+
+static int setAllOutputsInvertedStored(bool inverted) {
+  uint8_t count = EE::read(0);
+  int changed = 0;
+
+  for (int i = 0; i < count && i < EEPROM_MAX_ENTRIES; i++) {
+    PinConfig cfg{};
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+    if (!isOutputConfigType(cfg.type)) continue;
+
+    bool oldInv = pinConfigOutputInverted(cfg);
+    if (oldInv != inverted) {
+      pinConfigSetOutputInverted(cfg, inverted);
+      EE_PUT(1 + i * sizeof(PinConfig), cfg);
+      changed++;
+    }
+
+    if (cfg.type == 2) {
+      applyLocalOutputInversionByPin(cfg.pin, inverted);
+    }
+  }
+
+  if (changed > 0) EE::commit();
+  return changed;
+}
+
+static uint8_t menuOutputCountProvider() {
+  return (uint8_t)outputCount;
+}
+
+static String menuOutputLabelProvider(uint8_t index) {
+  if (index >= outputCount) return String("OUT ?");
+  String label = outputParams[index] ? String(outputParams[index]) : String("OUT");
+  label += " P";
+  label += String(outputPinNum[index]);
+  return label;
+}
+
+static int menuOutputStateProvider(uint8_t index) {
+  if (index >= outputCount || !outputPins[index]) return 0;
+  int physical = outputPins[index]->digitalRead() == HIGH ? 1 : 0;
+  return physicalToLogicalOutputValue(physical, outputInvertedFlags[index]);
+}
+
+static void menuOutputSet(uint8_t index, bool on) {
+  writeLocalOutputByIndex((int)index, on ? 1 : 0);
+}
+
+static bool menuAllOutInvGetter() {
+  return areAllOutputsInverted();
+}
+
+static void menuAllOutInvSetter(bool enabled) {
+  int changed = setAllOutputsInvertedStored(enabled);
+  Serial.printf("MENU OUTINV ALL %s changed=%d\n", enabled ? "ON" : "OFF", changed);
+}
+
+static String menuEthStatusDetails() {
+  bool linkUp = ETH.linkUp();
+  IPAddress ip = ETH.localIP();
+  bool hasIp = (ip != IPAddress((uint32_t)0));
+  IPAddress srvIp = serverDiscovery.serverIp();
+
+  String s;
+  s.reserve(96);
+  s += "LINK:";
+  s += linkUp ? "UP" : "DOWN";
+  s += "\nIP:";
+  s += hasIp ? ip.toString() : "0.0.0.0";
+  s += "\nCLI5090:";
+  s += serverDiscovery.connected() ? "UP" : "DOWN";
+  s += "\nSRV:";
+  s += serverDiscovery.hasServerIp() ? srvIp.toString() : "0.0.0.0";
+  return s;
+}
+
+static String menuCanStatusDetails() {
+  String s;
+  s.reserve(96);
+  s += "CAN:";
+  s += g_can_started ? "ON" : "OFF";
+  s += "\nHELLO:";
+  if (g_can_seen_hello) {
+    s += "N";
+    s += String(g_can_last_hello_node);
+    s += " ";
+    s += String((millis() - g_can_last_hello_ms) / 1000);
+    s += "s";
+  } else {
+    s += "NONE";
+  }
+  s += "\nHB:";
+  if (g_can_seen_heartbeat) {
+    s += "N";
+    s += String(g_can_last_hb_node);
+    s += " ";
+    s += String((millis() - g_can_last_hb_ms) / 1000);
+    s += "s";
+  } else {
+    s += "NONE";
+  }
+  s += "\nACK:";
+  if (g_can_seen_ack) {
+    s += "N";
+    s += String(g_can_last_ack_node);
+    s += ":";
+    s += String(g_can_last_ack_channel);
+    s += "=";
+    s += String(g_can_last_ack_value);
+  } else {
+    s += "NONE";
+  }
+  return s;
+}
+
+static String menuIoStatusDetails() {
+  int activeButtons = 0;
+  int activeSwitches = 0;
+  int activeOutputs = 0;
+
+  for (int i = 0; i < buttonCount; i++) {
+    if (buttonPins[i] && buttonPins[i]->digitalRead() == LOW) activeButtons++;
+  }
+  for (int i = 0; i < switchCount; i++) {
+    if (switchPins[i] && switchPins[i]->digitalRead() == LOW) activeSwitches++;
+  }
+  for (int i = 0; i < outputCount; i++) {
+    if (!outputPins[i]) continue;
+    int physical = outputPins[i]->digitalRead() == HIGH ? 1 : 0;
+    if (physicalToLogicalOutputValue(physical, outputInvertedFlags[i])) activeOutputs++;
+  }
+
+  String s;
+  s.reserve(96);
+  s += "BTN ";
+  s += String(activeButtons);
+  s += "/";
+  s += String(buttonCount);
+  s += " SW ";
+  s += String(activeSwitches);
+  s += "/";
+  s += String(switchCount);
+  s += "\nOUT ";
+  s += String(activeOutputs);
+  s += "/";
+  s += String(outputCount);
+  s += " SEL ";
+  s += String(selectorCount);
+  if (outputCount > 0 && outputParams[0]) {
+    s += "\nOUT0:";
+    s += String(outputParams[0]).substring(0, 12);
+    s += "\nINVALL:";
+    s += areAllOutputsInverted() ? "ON" : "OFF";
+  } else {
+    s += "\nNO LOCAL OUT";
+  }
+  return s;
+}
+
 static String buildModbusSetFromKV(const String& key, const String& valueCSV){
   String out = "MB.SET ";
   out += key;
@@ -1011,6 +1351,7 @@ void loadConfigFromEEPROM() {
   // reset RAM containers
   clearSelectorsRAM();
   switchCount = buttonCount = potCount = outputCount = 0;
+  memset(outputInvertedFlags, 0, sizeof(outputInvertedFlags));
 
   uint8_t count = EE::read(0);
   if (count == 0xFF) {
@@ -1086,10 +1427,11 @@ void loadConfigFromEEPROM() {
         outputPinNum[outputCount] = cfg.pin;
         outputParams[outputCount] = copy;
         outputPins[outputCount]   = pin;
+        outputInvertedFlags[outputCount] = pinConfigOutputInverted(cfg);
         outputs[outputCount]      = new OutputManagerMCP(copy, pin);
         outputs[outputCount]->begin();
-        // ✅ Por seguridad: todo LOW al arrancar
-        pin->digitalWrite(LOW);
+        // Mantiene la salida en OFF lógico respetando inversión configurada.
+        writeLocalOutputByIndex(outputCount, 0);
         outputCount++;
         break;
       }
@@ -1672,6 +2014,108 @@ void updatePotParam(String cmd) {
       return;
     }
   }
+}
+
+static bool handleOutputInvertConfig(String cmd) {
+  char target[24], field[16], state[16];
+  int args = sscanf(cmd.c_str() + 4, "%23s %15s %15s", target, field, state);
+  if (args < 3) return false;
+  if (strcasecmp(field, "OUTINV") != 0) return false;
+
+  int invInt = 0;
+  if (!parseValueToInt(String(state), invInt)) {
+    enviar(F("ERR CFG OUTINV (usa ON|OFF)"));
+    return true;
+  }
+
+  bool inverted = invInt != 0;
+  uint8_t count = EE::read(0);
+  int matched = 0;
+  int changed = 0;
+  uint8_t canNode = 0, canChannel = 0;
+  bool isCanTarget = parseCanRef(target, canNode, canChannel);
+
+  bool isPinTarget = isdigit((unsigned char)target[0]) != 0;
+  if (!isPinTarget && (target[0] == 'A' || target[0] == 'a')) {
+    isPinTarget =
+      isdigit((unsigned char)target[1]) != 0 ||
+      strncasecmp(target, "ADS", 3) == 0;
+  }
+
+  if (strcasecmp(target, "ALL") == 0) {
+    for (int i = 0; i < count; i++) {
+      PinConfig cfg{};
+      EE_GET(1 + i * sizeof(PinConfig), cfg);
+      if (!isOutputConfigType(cfg.type)) continue;
+
+      matched++;
+      bool oldInv = pinConfigOutputInverted(cfg);
+      if (oldInv == inverted) continue;
+
+      pinConfigSetOutputInverted(cfg, inverted);
+      EE_PUT(1 + i * sizeof(PinConfig), cfg);
+      changed++;
+
+      if (cfg.type == 2) {
+        applyLocalOutputInversionByPin(cfg.pin, inverted);
+      }
+    }
+
+    if (changed > 0) EE::commit();
+
+    if (matched == 0) {
+      enviar(F("ERR CFG ALL OUTINV (sin salidas)"));
+    } else {
+      enviar(String("OK CFG ALL OUTINV ") + (inverted ? "ON" : "OFF") +
+             " CHANGED=" + String(changed));
+    }
+    return true;
+  }
+
+  if (!isCanTarget && !isPinTarget) {
+    enviar(String("ERR CFG OUTINV destino invalido: ") + target);
+    return true;
+  }
+
+  int pinTarget = isCanTarget ? -1 : analogPinFromString(target);
+  for (int i = 0; i < count; i++) {
+    PinConfig cfg{};
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+
+    bool match = false;
+    if (isCanTarget) {
+      match = (cfg.type == PIN_TYPE_CAN_OUTPUT &&
+               cfg.minIn == canNode &&
+               cfg.pin == canChannel);
+    } else {
+      match = (cfg.type == 2 && cfg.pin == (uint8_t)pinTarget);
+    }
+
+    if (!match) continue;
+
+    matched++;
+    bool oldInv = pinConfigOutputInverted(cfg);
+    if (oldInv != inverted) {
+      pinConfigSetOutputInverted(cfg, inverted);
+      EE_PUT(1 + i * sizeof(PinConfig), cfg);
+      EE::commit();
+      changed++;
+    }
+
+    if (cfg.type == 2) {
+      applyLocalOutputInversionByPin(cfg.pin, inverted);
+    }
+
+    enviar(String("OK CFG ") +
+           (isCanTarget
+              ? canRefToString(canNode, canChannel)
+              : pinToStringForDump(cfg.pin, cfg.type)) +
+           " OUTINV " + (inverted ? "ON" : "OFF"));
+    return true;
+  }
+
+  enviar(String("ERR CFG OUTINV no encontrado: ") + target);
+  return true;
 }
 
 static void nvsWipeAllAndReboot() {
@@ -2612,7 +3056,10 @@ static bool tryCanOutputByName(const char* name, int value) {
 
       uint8_t node = (uint8_t)cfg.minIn;
       uint8_t ch   = cfg.pin;
-      uint8_t val  = value ? 1 : 0;
+      uint8_t val  = (uint8_t)logicalToPhysicalOutputValue(
+        value ? 1 : 0,
+        pinConfigOutputInverted(cfg)
+      );
 
       canManager.sendOutputSet(node, ch, val);
 
@@ -3212,7 +3659,7 @@ void handleLine(const char* command, const char* value) {
       modbusRefreshWindow();
 
       for (int i=0;i<outputCount;i++){
-        if (outputPins[i]) outputPins[i]->digitalWrite(LOW);
+        writeLocalOutputByIndex(i, 0);
       }
 
     } else {
@@ -3714,6 +4161,12 @@ void handleLine(const char* command, const char* value) {
         linea += " ";
         linea += String(cfg.param) + " 0 1";
         enviar(linea);
+        if (cfg.type == PIN_TYPE_CAN_OUTPUT) {
+          enviar(String("CFG ") +
+                 canRefToString((uint8_t)cfg.minIn, cfg.pin) +
+                 " OUTINV " +
+                 (pinConfigOutputInverted(cfg) ? "ON" : "OFF"));
+        }
         continue;
       }
 
@@ -3729,6 +4182,13 @@ void handleLine(const char* command, const char* value) {
                 String(cfg.minOut, 3) + " " +
                 String(cfg.maxOut, 3);
       enviar(linea);
+
+      if (cfg.type == 2) {
+        enviar(String("CFG ") +
+               pinToStringForDump(cfg.pin, cfg.type) +
+               " OUTINV " +
+               (pinConfigOutputInverted(cfg) ? "ON" : "OFF"));
+      }
 
       if (cfg.type == 3) {
         String scale = "CFG " + pinToStringForDump(cfg.pin, cfg.type) +
@@ -3922,6 +4382,9 @@ void handleLine(const char* command, const char* value) {
 
   // ===================== CFG (POT params) =====================
   if (modoConfig && cmd.startsWith("CFG")) {
+    if (handleOutputInvertConfig(cmd)) {
+      HRET();
+    }
     updatePotParam(cmd);
     HRET();
   }
@@ -3944,17 +4407,14 @@ void handleLine(const char* command, const char* value) {
     if (key.length()) {
       key.trim(); v.trim();
 
-      for (int i=0;i<outputCount;i++){
-        if (outputs[i] && outputParams[i] && strcasecmp(outputParams[i], key.c_str()) == 0) {
-          outputs[i]->outputDigital(key.c_str(), v.c_str(), 1);
+      int outVal = 0;
+      if (parseValueToInt(v, outVal) && writeLocalOutputByName(key.c_str(), outVal)) {
           enviar("✅ ACK: " + key + "=" + v);
           HRET();
-        }
       }
 
       // ---- Salidas CAN por nombre ----
       // Ejemplo: PZB_LED=1 -> CAN OUTPUT configurado como PZB_LED
-      int outVal = 0;
       if (parseValueToInt(v, outVal)) {
         if (tryCanOutputByName(key.c_str(), outVal)) {
           enviar("✅ ACK CAN: " + key + "=" + v);
@@ -3975,8 +4435,10 @@ void handleLine(const char* command, const char* value) {
 
   // ===================== Fallback outputs por "command value" =====================
   bool handled = false;
-  for (int i = 0; i < outputCount; i++) {
-    if (outputs[i] && outputs[i]->outputDigital(command, value ? value : "", 1)) handled = true;
+  int outVal = 0;
+  if (value && parseValueToInt(String(value), outVal)) {
+    if (writeLocalOutputByName(command, outVal)) handled = true;
+    else if (tryCanOutputByName(command, outVal)) handled = true;
   }
   if (handled) enviar("✅ ACK: " + String(command));
   else         enviar("❌ NACK: " + String(command));
@@ -4107,7 +4569,7 @@ void setup() {
   EE::begin(EE_SIZE_BYTES);
   EE_ensureCountByte();
 
-  ElegantOTA.begin(&serverOTA);
+  //ElegantOTA.begin(&serverOTA);
 
   for (int i=0;i<EEPROM_MAX_ENTRIES;i++){
     potEMA[i]=NAN;
@@ -4342,30 +4804,79 @@ void setup() {
   //CANBUS Devices
 
   canManager.begin(CAN_TX_PIN, CAN_RX_PIN, 500000);
+  g_can_started = true;
 
   canManager.onInput([](uint8_t node, uint8_t channel, uint8_t value) {
     handleCanInput(node, channel, value);
   });
 
   canManager.onHello([](uint8_t node) {
+    g_can_seen_hello = true;
+    g_can_last_hello_node = node;
+    g_can_last_hello_ms = millis();
     enviar(String("✅ CAN HELLO node=") + String(node));
   });
 
   canManager.onHeartbeat([](uint8_t node) {
-    // opcional, no saturar log
+    g_can_seen_heartbeat = true;
+    g_can_last_hb_node = node;
+    g_can_last_hb_ms = millis();
   });
 
   canManager.onOutputAck([](uint8_t node, uint8_t channel, uint8_t value) {
+    g_can_seen_ack = true;
+    g_can_last_ack_node = node;
+    g_can_last_ack_channel = channel;
+    g_can_last_ack_value = value;
+    g_can_last_ack_ms = millis();
     enviar(String("✅ CAN ACK CAN") +
             String(node) + ":" + String(channel) +
             "=" + String(value));
   });
 
-  /*pcf.begin();
+  #if defined(SSD1309)
+  IPAddress menuIp = EE::getStaticIP();
+  IPAddress menuGw = EE::getStaticGateway();
+  IPAddress menuMask = EE::getStaticMask();
+
+  if (menuIp == IPAddress(0, 0, 0, 0)) {
+    menuIp = IPAddress(192, 168, 1, 177);
+  }
+  if (menuGw == IPAddress(0, 0, 0, 0)) {
+    menuGw = IPAddress(menuIp[0], menuIp[1], menuIp[2], 1);
+  }
+  if (menuMask == IPAddress(0, 0, 0, 0)) {
+    menuMask = IPAddress(255, 255, 255, 0);
+  }
+
   menu.begin();
-  menu.beginPCF(pcf, 0, 1, 2, 3, 4, 5, true);
+  menu.setNetCurrent(EE::getDhcpEnabled(), menuIp, menuGw, menuMask);
+  menu.setOnApply(menuApplyNet);
+  menu.setOnExit(menuClosed);
+  menu.setStatusProvider(menuStatusProvider);
+  menu.setEthStatusProvider(menuEthStatusDetails);
+  menu.setCanStatusProvider(menuCanStatusDetails);
+  menu.setIoStatusProvider(menuIoStatusDetails);
+  menu.setOutputCountProvider(menuOutputCountProvider);
+  menu.setOutputLabelProvider(menuOutputLabelProvider);
+  menu.setOutputStateProvider(menuOutputStateProvider);
+  menu.setOutputSetFn(menuOutputSet);
+  menu.setAllOutInvGetter(menuAllOutInvGetter);
+  menu.setAllOutInvSetter(menuAllOutInvSetter);
+  menu.setOnToolDump(menuToolDump);
+  menu.setOnToolScanI2C(menuToolScanI2C);
   menu.setOnToolReboot(toolReboot);
-  menu.open();*/
+
+  bool pcfOk = pcf.begin();
+  Serial.printf("pcfOK=%d\n", pcfOk ? 1 : 0);
+  menuPcfReady = pcfOk;
+  if (pcfOk) {
+    menu.beginPCF(pcf, 0, 1, 2, 3, 4, 5, true);
+    Serial.println("✅ Menu SSD1309 listo (mantener ENT 5s para abrir)");
+  } else {
+    Serial.println("⚠️ PCF8574 no detectado, menu no activado");
+  }
+  #endif
 
   #if defined(MODO_SERIAL)
     serialInterface.begin();
@@ -4380,7 +4891,7 @@ void setup() {
   for (int i = 0; i < buttonCount; i++) buttons[i]->begin();
   for (int i = 0; i < outputCount; i++) {
     outputs[i]->begin();
-    if (outputPins[i]) outputPins[i]->digitalWrite(LOW); // ✅ LOW al arranque
+    writeLocalOutputByIndex(i, 0);
     enviar(String("register(") + outputParams[i] + ")");
   }
   for (int i = 0; i < selectorCount; i++) {
@@ -4394,8 +4905,15 @@ void loop() {
   handleAPButton();
 
   // 2) refresca OLED (I2C, no bloqueante)
+  pollButtonsESP32();
+  #if defined(SSD1309)
+  pollMenuEnterHold();
+  if (!menu.isActive()) {
+    oledMaybeDrawChangeOnly();
+  }
+  #else
   oledMaybeDrawChangeOnly();
-  pollButtonsESP32();  
+  #endif
   tickIoStates();
   tickIoWatch();
   canManager.loop();
@@ -4454,10 +4972,12 @@ void loop() {
   tickModbus();
   ElegantOTA.loop();
 
-  /*if (menu.isActive()) {
+  #if defined(SSD1309)
+  if (menu.isActive()) {
     menu.tick();
     return;
-  }*/
+  }
+  #endif
 
   // 4) IO (MCP) + POTS
   if (!modoConfig && !bloqueado) {

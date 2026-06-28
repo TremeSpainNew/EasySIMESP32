@@ -16,6 +16,7 @@
 #include <ctype.h>
 #include "nvs_flash.h"
 #include <io/Menu.h>
+#define ELEGANTOTA_USE_ASYNC_WEBSERVER 1
 #include <ElegantOTA.h>      // NUEVO: ElegantOTA para actualizaciones vía web
 #include <math.h>               // isnan, fabs, lroundf
 #include <Adafruit_ADS1X15.h>   // ADS1115<<
@@ -269,6 +270,14 @@ static String oledLastFrame;
 static unsigned long lastPotsMs = 0;
 static const unsigned long POTS_PERIOD_MS = 20;
 static bool menuPcfReady = false;
+static bool fsReady = false;
+static bool webUiReady = false;
+static bool otaReady = false;
+static bool webAuthReady = false;
+static String webAdminUser = "admin";
+static String webAdminPass;
+static const char* apSsid = "EASYSIMBigBoard";
+static const char* apPassword = "easysim123";
 
 #if defined(SSD1309)
 static constexpr uint8_t MENU_PCF_PIN_ENT = 4;
@@ -559,6 +568,62 @@ static void menuToolScanI2C() {
 
 static void menuClosed() {
   oledRequest();
+}
+
+static String buildWebAdminPassword() {
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[16];
+  snprintf(buf, sizeof(buf), "easy%06X", (uint32_t)(mac & 0xFFFFFF));
+  return String(buf);
+}
+
+static void ensureWebAuthConfig() {
+  if (webAuthReady) return;
+
+  webAdminPass = buildWebAdminPassword();
+  configurarAuthServidorWeb(webAdminUser, webAdminPass);
+  webAuthReady = true;
+  Serial.printf("🔐 Web/OTA auth -> user=%s pass=%s\n", webAdminUser.c_str(), webAdminPass.c_str());
+}
+
+static void ensureWirelessUpdateServer() {
+  ensureWebAuthConfig();
+
+  if (!fsReady) {
+    fsReady = LittleFS.begin(false);
+    Serial.printf("LittleFS=%d\n", fsReady ? 1 : 0);
+    if (fsReady) {
+      cargarConfig();
+    } else {
+      Serial.println("⚠️ LittleFS no disponible, no se formatea automaticamente");
+    }
+  }
+
+  if (!webUiReady) {
+    if (fsReady) {
+      iniciarServidorWeb();
+    } else {
+      auto& rootHandler = server.on("/", AsyncWebRequestMethod::HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain",
+          "EasySim OTA activo\nAbrir /update para actualizar firmware.");
+      });
+      rootHandler.setAuthentication(webAdminUser, webAdminPass);
+    }
+    webUiReady = true;
+  }
+
+  if (!otaReady) {
+    auto& otaRedirectHandler = server.on("/ota", AsyncWebRequestMethod::HTTP_GET, [](AsyncWebServerRequest *request) {
+      request->redirect("/update");
+    });
+    otaRedirectHandler.setAuthentication(webAdminUser, webAdminPass);
+
+    ElegantOTA.begin(&server, webAdminUser.c_str(), webAdminPass.c_str());
+    otaReady = true;
+    Serial.println("✅ OTA web activa en /update y /ota");
+  }
+
+  arrancarServidorWeb();
 }
 
 static void pollMenuEnterHold() {
@@ -2185,6 +2250,7 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t /*info*/) {
   if (event == ARDUINO_EVENT_ETH_GOT_IP) {
     eth_connected = true;
     Serial.println("🌐 Ethernet conectado");
+    ensureWirelessUpdateServer();
   } else if (event == ARDUINO_EVENT_ETH_DISCONNECTED ||
             event == ARDUINO_EVENT_ETH_LOST_IP      ||
             event == ARDUINO_EVENT_ETH_STOP) {
@@ -4511,18 +4577,24 @@ void enableAP() {
   WiFi.mode(WIFI_AP);          // <- clave
   delay(100);
 
-  const char* ssid = "EASYSIMBigBoard";
-  const char* pass = nullptr;  // abierto (más fácil de ver)
+  ensureWebAuthConfig();
   int channel = 1;             // 1..13
   bool hidden = false;
-  int maxConn = 1;
+  int maxConn = 4;
 
-  bool ok = WiFi.softAP(ssid, pass, channel, hidden, maxConn);
+  bool ok = WiFi.softAP(apSsid, apPassword, channel, hidden, maxConn);
   delay(200);
 
   IPAddress ip = WiFi.softAPIP();
   Serial.printf("🌐 AP enable: ok=%d mode=%d ssid=%s ip=%s\n",
                 ok ? 1 : 0, (int)WiFi.getMode(), WiFi.softAPSSID().c_str(), ip.toString().c_str());
+
+  if (ok) {
+    ensureWirelessUpdateServer();
+    Serial.printf("🔄 OTA web: http://%s/update\n", ip.toString().c_str());
+    Serial.printf("🔐 AP password: %s\n", apPassword);
+    Serial.printf("🔐 Web/OTA auth: user=%s pass=%s\n", webAdminUser.c_str(), webAdminPass.c_str());
+  }
 
   if (!wifiServerStarted) {
     wifiServer.begin();
@@ -4558,8 +4630,6 @@ static void toolReboot() {
 #endif
 }
 
-AsyncWebServer serverOTA(80);
-
 // ======================= setup/loop =======================
 void setup() {
   #if defined(MODO_SERIAL)
@@ -4568,8 +4638,6 @@ void setup() {
 
   EE::begin(EE_SIZE_BYTES);
   EE_ensureCountByte();
-
-  //ElegantOTA.begin(&serverOTA);
 
   for (int i=0;i<EEPROM_MAX_ENTRIES;i++){
     potEMA[i]=NAN;

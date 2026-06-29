@@ -1,51 +1,49 @@
 #include "CanManager.h"
+#include <driver/twai.h>
 
 CanManager canManager;
+static CanManager* g_canManagerInstance = nullptr;
 
 bool CanManager::begin(gpio_num_t txPin, gpio_num_t rxPin, uint32_t speed) {
-  twai_general_config_t g_config =
-      TWAI_GENERAL_CONFIG_DEFAULT(txPin, rxPin, TWAI_MODE_NORMAL);
+  g_canManagerInstance = this;
 
-  twai_timing_config_t t_config;
-
-  switch (speed) {
-    case 125000:
-      t_config = TWAI_TIMING_CONFIG_125KBITS();
-      break;
-    case 250000:
-      t_config = TWAI_TIMING_CONFIG_250KBITS();
-      break;
-    case 500000:
-    default:
-      t_config = TWAI_TIMING_CONFIG_500KBITS();
-      break;
+  for (int i = 0; i < 128; ++i) {
+    knownNodes[i] = false;
+    knownLastSeen[i] = 0;
   }
-
-  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-    Serial.println("❌ CAN: error instalando driver TWAI");
-    return false;
+  for (int i = 0; i < MAX_REGISTERED_PROFILES; ++i) {
+    profiles[i] = nullptr;
   }
+  profileCount = 0;
 
-  if (twai_start() != ESP_OK) {
-    Serial.println("❌ CAN: error arrancando TWAI");
+  can.onInput(&CanManager::bridgeInput);
+
+  if (!can.beginMaster((long)speed, (int)rxPin, (int)txPin)) {
+    Serial.println("❌ CAN: error arrancando EasySIM_CAN master");
+    started = false;
     return false;
   }
 
   Serial.println("✅ CAN iniciado correctamente");
+  can.scan();
+  started = true;
+  lastScanMs = millis();
   return true;
 }
 
 void CanManager::loop() {
-  twai_message_t msg;
+  if (!started) return;
 
-  while (twai_receive(&msg, 0) == ESP_OK) {
-    handleFrame(msg);
+  can.loop();
+  pollKnownNodes();
+
+  if ((millis() - lastScanMs) >= 5000) {
+    can.scan();
+    lastScanMs = millis();
   }
 }
 
-bool CanManager::sendFrame(uint32_t id, const uint8_t* data, uint8_t len) {
+bool CanManager::sendLegacyFrame(uint32_t id, const uint8_t* data, uint8_t len) {
   if (len > 8) return false;
 
   twai_message_t msg = {};
@@ -62,51 +60,122 @@ bool CanManager::sendFrame(uint32_t id, const uint8_t* data, uint8_t len) {
 }
 
 bool CanManager::sendOutputSet(uint8_t node, uint8_t channel, uint8_t value) {
-  uint8_t data[3] = { node, channel, value };
-  return sendFrame(EASY_CAN_ID_OUTPUT_SET, data, 3);
+  if (!started) return false;
+
+  can.sendDigitalOutput(node, channel, value ? 1 : 0);
+
+  if (outputAckCb) {
+    outputAckCb(node, channel, value ? 1 : 0);
+  }
+
+  return true;
+}
+
+bool CanManager::sendOutputByCommand(const char* command, uint8_t value, bool* usedProfileInvert) {
+  if (usedProfileInvert) {
+    *usedProfileInvert = false;
+  }
+
+  if (!started || !command || !command[0]) return false;
+
+  for (uint8_t node = 0; node < 128; ++node) {
+    const EasySimCANNodeInfo* info = can.nodeInfo(node);
+    if (!info || !info->online) continue;
+
+    const EasySimCANProfile* profile = registeredProfileByType(info->profile);
+    if (!profile) continue;
+
+    const EasySimCANPinConfig* pinCfg = profile->pinByCommand(command);
+    if (!pinCfg) continue;
+    if (pinCfg->mode != EasySimCANPinMode::OUTPUT_MODE) continue;
+
+    uint8_t finalValue = value ? 1 : 0;
+    if (pinCfg->inverted) {
+      finalValue = finalValue ? 0 : 1;
+      if (usedProfileInvert) {
+        *usedProfileInvert = true;
+      }
+    }
+
+    can.sendDigitalOutput(node, pinCfg->globalPin, finalValue);
+
+    if (outputAckCb) {
+      outputAckCb(node, pinCfg->globalPin, finalValue);
+    }
+
+    return true;
+  }
+
+  return false;
 }
 
 bool CanManager::sendHeartbeat(uint8_t node) {
   uint8_t data[1] = { node };
-  return sendFrame(EASY_CAN_ID_HEARTBEAT, data, 1);
+  return sendLegacyFrame(EASY_CAN_ID_HEARTBEAT, data, 1);
 }
 
 bool CanManager::sendHello(uint8_t node, uint8_t inputs, uint8_t outputs) {
   uint8_t data[3] = { node, inputs, outputs };
-  return sendFrame(EASY_CAN_ID_HELLO, data, 3);
+  return sendLegacyFrame(EASY_CAN_ID_HELLO, data, 3);
 }
 
-void CanManager::handleFrame(const twai_message_t& msg) {
-  if (msg.data_length_code == 0) return;
+void CanManager::bridgeInput(uint8_t node, uint8_t channel, int value, const char* command) {
+  if (!g_canManagerInstance) return;
+  g_canManagerInstance->handleInput(node, channel, (uint8_t)(value ? 1 : 0), command);
+}
 
-  switch (msg.identifier) {
-    case EASY_CAN_ID_HELLO:
-      if (msg.data_length_code >= 1 && helloCb) {
-        helloCb(msg.data[0]);
-      }
-      break;
-
-    case EASY_CAN_ID_HEARTBEAT:
-      if (msg.data_length_code >= 1 && heartbeatCb) {
-        heartbeatCb(msg.data[0]);
-      }
-      break;
-
-    case EASY_CAN_ID_INPUT_CHANGE:
-      if (msg.data_length_code >= 3 && inputCb) {
-        inputCb(msg.data[0], msg.data[1], msg.data[2]);
-      }
-      break;
-
-    case EASY_CAN_ID_OUTPUT_ACK:
-      if (msg.data_length_code >= 3 && outputAckCb) {
-        outputAckCb(msg.data[0], msg.data[1], msg.data[2]);
-      }
-      break;
-
-    default:
-      break;
+void CanManager::handleInput(uint8_t node, uint8_t channel, uint8_t value, const char* command) {
+  if (inputCb) {
+    inputCb(node, channel, value, command);
   }
+}
+
+void CanManager::pollKnownNodes() {
+  for (uint8_t node = 0; node < 128; ++node) {
+    const EasySimCANNodeInfo* info = can.nodeInfo(node);
+    if (!info || !info->online) continue;
+
+    if (!knownNodes[node]) {
+      knownNodes[node] = true;
+      if (helloCb) {
+        helloCb(node);
+      }
+    }
+
+    if (knownLastSeen[node] != info->lastSeenMs) {
+      knownLastSeen[node] = info->lastSeenMs;
+      if (heartbeatCb) {
+        heartbeatCb(node);
+      }
+    }
+  }
+}
+
+void CanManager::registerProfile(EasySimCANProfile* profile) {
+  if (!profile) return;
+
+  can.registerProfile(profile);
+
+  for (uint8_t i = 0; i < profileCount; ++i) {
+    if (profiles[i] == profile || (profiles[i] && profiles[i]->type() == profile->type())) {
+      profiles[i] = profile;
+      return;
+    }
+  }
+
+  if (profileCount < MAX_REGISTERED_PROFILES) {
+    profiles[profileCount++] = profile;
+  }
+}
+
+const EasySimCANProfile* CanManager::registeredProfileByType(EasySimCANProfileType type) const {
+  for (uint8_t i = 0; i < profileCount; ++i) {
+    if (profiles[i] && profiles[i]->type() == type) {
+      return profiles[i];
+    }
+  }
+
+  return nullptr;
 }
 
 void CanManager::onInput(InputCallback cb) {

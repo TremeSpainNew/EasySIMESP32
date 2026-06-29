@@ -7,24 +7,24 @@
 #include <SPI.h>
 #include <RS485.h>
 #include <NetworkClient.h>
+#include <NetworkServer.h>
 #include <MCPBusController.h>
 #include <WiFiAP.h>
-#include "WebConfig.h"
 #include <modbus.h>             // usa EE por dentro
 #include "Wire.h"
 #include <Adafruit_NeoPixel.h>
 #include <ctype.h>
 #include "nvs_flash.h"
 #include <io/Menu.h>
-#define ELEGANTOTA_USE_ASYNC_WEBSERVER 1
-#include <ElegantOTA.h>      // NUEVO: ElegantOTA para actualizaciones vía web
 #include <math.h>               // isnan, fabs, lroundf
 #include <Adafruit_ADS1X15.h>   // ADS1115<<
+#include <Update.h>
 #include <WiFiUdp.h>            // UDP para discover (usado dentro de ServerDiscovery normalmente)
 #include "EthernetInterface.h"  // interfaz TCP puerto 5000
 #include <ServerDiscovery.h>    // NUEVO: discover+cliente 5090 con callbacks
 
 #include "CanManager.h"
+#include <Profiles/ASFADigitalProfile.h>
 
 #define CAN_TX_PIN GPIO_NUM_1
 #define CAN_RX_PIN GPIO_NUM_2
@@ -85,6 +85,8 @@ void handleMbCommand(const String& cmd);
 void handleAPButton();
 void enableAP();
 void disableAP();
+static void startDirectOtaServer();
+static void pollDirectOtaServer();
 static bool parseCanRef(const char* s, uint8_t& node, uint8_t& channel);
 static String canRefToString(uint8_t node, uint8_t channel);
 
@@ -133,6 +135,12 @@ WiFiServer wifiServer(5000); // servidor TCP en el AP, puerto 5000
 WiFiClient wifiClient;
 bool wifiServerStarted = false;
 #endif
+
+static constexpr uint16_t kOtaTcpPort = 3232;
+NetworkServer otaServer(kOtaTcpPort);
+bool otaServerStarted = false;
+bool otaRestartPending = false;
+unsigned long otaRestartAtMs = 0;
 
 enum CanalActivo { CANAL_SERIAL, CANAL_TCP };
 CanalActivo canalActivo = CANAL_SERIAL;
@@ -203,6 +211,7 @@ static uint8_t g_can_last_ack_value = 0;
 static unsigned long g_can_last_hello_ms = 0;
 static unsigned long g_can_last_hb_ms = 0;
 static unsigned long g_can_last_ack_ms = 0;
+static ASFADigitalProfile g_can_profile_asfad;
 
 bool ioWatchEnabled = false;
 uint8_t ioWatchPin = 0;
@@ -270,12 +279,6 @@ static String oledLastFrame;
 static unsigned long lastPotsMs = 0;
 static const unsigned long POTS_PERIOD_MS = 20;
 static bool menuPcfReady = false;
-static bool fsReady = false;
-static bool webUiReady = false;
-static bool otaReady = false;
-static bool webAuthReady = false;
-static String webAdminUser = "admin";
-static String webAdminPass;
 static const char* apSsid = "EASYSIMBigBoard";
 static const char* apPassword = "easysim123";
 
@@ -570,60 +573,186 @@ static void menuClosed() {
   oledRequest();
 }
 
-static String buildWebAdminPassword() {
-  uint64_t mac = ESP.getEfuseMac();
-  char buf[16];
-  snprintf(buf, sizeof(buf), "easy%06X", (uint32_t)(mac & 0xFFFFFF));
-  return String(buf);
+static bool otaReadLine(NetworkClient& client, String& line, unsigned long timeoutMs) {
+  line = "";
+  unsigned long startMs = millis();
+
+  while ((millis() - startMs) < timeoutMs) {
+    while (client.available()) {
+      char ch = (char)client.read();
+
+      if (ch == '\n') {
+        line.trim();
+        return true;
+      }
+
+      if (ch != '\r') {
+        line += ch;
+        if (line.length() > 160) {
+          return false;
+        }
+      }
+    }
+
+    if (!client.connected()) {
+      return false;
+    }
+
+    delay(1);
+    yield();
+  }
+
+  return false;
 }
 
-static void ensureWebAuthConfig() {
-  if (webAuthReady) return;
+static void startDirectOtaServer() {
+  if (otaServerStarted) return;
 
-  webAdminPass = buildWebAdminPassword();
-  configurarAuthServidorWeb(webAdminUser, webAdminPass);
-  webAuthReady = true;
-  Serial.printf("🔐 Web/OTA auth -> user=%s pass=%s\n", webAdminUser.c_str(), webAdminPass.c_str());
+  otaServer.begin();
+  otaServerStarted = true;
+  Serial.printf("🚀 OTA TCP escuchando en puerto %u\n", kOtaTcpPort);
 }
 
-static void ensureWirelessUpdateServer() {
-  ensureWebAuthConfig();
+static void handleDirectOtaClient(NetworkClient& client) {
+  String header;
+  if (!otaReadLine(client, header, 5000)) {
+    client.println("ERR HEADER");
+    return;
+  }
 
-  if (!fsReady) {
-    fsReady = LittleFS.begin(false);
-    Serial.printf("LittleFS=%d\n", fsReady ? 1 : 0);
-    if (fsReady) {
-      cargarConfig();
-    } else {
-      Serial.println("⚠️ LittleFS no disponible, no se formatea automaticamente");
+  header.trim();
+  if (!header.length()) {
+    client.println("ERR EMPTY");
+    return;
+  }
+
+  if (header == "PING") {
+    client.println("PONG OTA");
+    return;
+  }
+
+  int sp1 = header.indexOf(' ');
+  int sp2 = (sp1 >= 0) ? header.indexOf(' ', sp1 + 1) : -1;
+
+  String cmd = (sp1 >= 0) ? header.substring(0, sp1) : header;
+  String sizeText = (sp1 >= 0 && sp2 > sp1) ? header.substring(sp1 + 1, sp2) : "";
+  String md5Text = (sp2 > sp1) ? header.substring(sp2 + 1) : "";
+
+  cmd.trim();
+  sizeText.trim();
+  md5Text.trim();
+
+  if (cmd != "EASYSIM_OTA") {
+    client.println("ERR PROTOCOL");
+    return;
+  }
+
+  size_t firmwareSize = (size_t)strtoull(sizeText.c_str(), nullptr, 10);
+  if (!firmwareSize) {
+    client.println("ERR SIZE");
+    return;
+  }
+
+  if (!Update.begin(firmwareSize, U_FLASH)) {
+    client.print("ERR BEGIN ");
+    client.println(Update.errorString());
+    return;
+  }
+
+  if (md5Text.length() == 32 && !Update.setMD5(md5Text.c_str())) {
+    client.println("ERR MD5");
+    Update.abort();
+    return;
+  }
+
+  client.println("OK READY");
+  Serial.printf("🚀 OTA TCP inicio: %u bytes\n", (unsigned)firmwareSize);
+
+  uint8_t buffer[1024];
+  size_t received = 0;
+  size_t nextProgressMark = 65536;
+  unsigned long lastDataMs = millis();
+
+  while (received < firmwareSize) {
+    int availableBytes = client.available();
+
+    if (availableBytes > 0) {
+      size_t missing = firmwareSize - received;
+      size_t toRead = missing;
+      if (toRead > sizeof(buffer)) toRead = sizeof(buffer);
+      if (toRead > (size_t)availableBytes) toRead = (size_t)availableBytes;
+
+      int justRead = client.read(buffer, toRead);
+      if (justRead <= 0) {
+        client.println("ERR READ");
+        Update.abort();
+        return;
+      }
+
+      size_t written = Update.write(buffer, (size_t)justRead);
+      if (written != (size_t)justRead) {
+        client.print("ERR WRITE ");
+        client.println(Update.errorString());
+        Update.abort();
+        return;
+      }
+
+      received += written;
+      lastDataMs = millis();
+
+      if (received >= nextProgressMark || received == firmwareSize) {
+        Serial.printf("🚀 OTA TCP progreso: %u / %u\n", (unsigned)received, (unsigned)firmwareSize);
+        nextProgressMark += 65536;
+      }
+
+      continue;
     }
-  }
 
-  if (!webUiReady) {
-    if (fsReady) {
-      iniciarServidorWeb();
-    } else {
-      auto& rootHandler = server.on("/", AsyncWebRequestMethod::HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(200, "text/plain",
-          "EasySim OTA activo\nAbrir /update para actualizar firmware.");
-      });
-      rootHandler.setAuthentication(webAdminUser, webAdminPass);
+    if (!client.connected()) {
+      client.println("ERR DISCONNECTED");
+      Update.abort();
+      return;
     }
-    webUiReady = true;
+
+    if ((millis() - lastDataMs) > 10000) {
+      client.println("ERR TIMEOUT");
+      Update.abort();
+      return;
+    }
+
+    delay(1);
+    yield();
   }
 
-  if (!otaReady) {
-    auto& otaRedirectHandler = server.on("/ota", AsyncWebRequestMethod::HTTP_GET, [](AsyncWebServerRequest *request) {
-      request->redirect("/update");
-    });
-    otaRedirectHandler.setAuthentication(webAdminUser, webAdminPass);
-
-    ElegantOTA.begin(&server, webAdminUser.c_str(), webAdminPass.c_str());
-    otaReady = true;
-    Serial.println("✅ OTA web activa en /update y /ota");
+  if (!Update.end(true)) {
+    client.print("ERR END ");
+    client.println(Update.errorString());
+    Update.abort();
+    return;
   }
 
-  arrancarServidorWeb();
+  client.println("OK DONE");
+  delay(20);
+
+  Serial.println("✅ OTA TCP completada, reiniciando...");
+  otaRestartPending = true;
+  otaRestartAtMs = millis() + 500;
+}
+
+static void pollDirectOtaServer() {
+  if (otaRestartPending && millis() >= otaRestartAtMs) {
+    ESP.restart();
+  }
+
+  if (!otaServerStarted) return;
+
+  NetworkClient client = otaServer.accept();
+  if (!client) return;
+
+  Serial.println("📦 Cliente OTA TCP conectado");
+  handleDirectOtaClient(client);
+  delay(20);
+  client.stop();
 }
 
 static void pollMenuEnterHold() {
@@ -2250,7 +2379,8 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t /*info*/) {
   if (event == ARDUINO_EVENT_ETH_GOT_IP) {
     eth_connected = true;
     Serial.println("🌐 Ethernet conectado");
-    ensureWirelessUpdateServer();
+    startDirectOtaServer();
+    Serial.printf("🚀 OTA TCP disponible en %s:%u\n", ETH.localIP().toString().c_str(), kOtaTcpPort);
   } else if (event == ARDUINO_EVENT_ETH_DISCONNECTED ||
             event == ARDUINO_EVENT_ETH_LOST_IP      ||
             event == ARDUINO_EVENT_ETH_STOP) {
@@ -3083,7 +3213,7 @@ static bool saveCanConfig(const String& tipo, uint8_t node, uint8_t channel, con
   return true;
 }
 
-static void handleCanInput(uint8_t node, uint8_t channel, uint8_t value) {
+static void handleCanInput(uint8_t node, uint8_t channel, uint8_t value, const char* resolvedCommand = nullptr) {
   uint8_t count = EE::read(0);
 
   for (int i = 0; i < count && i < EEPROM_MAX_ENTRIES; i++) {
@@ -3101,6 +3231,13 @@ static void handleCanInput(uint8_t node, uint8_t channel, uint8_t value) {
 
       return;
     }
+  }
+
+  if (resolvedCommand && resolvedCommand[0]) {
+    String kv = String(resolvedCommand) + "=" + String(value ? 1 : 0);
+    enviar(kv);
+    enviarServidor(kv);
+    return;
   }
 
   enviar(String("⚠️ CAN INPUT sin asignar: CAN") +
@@ -3135,6 +3272,15 @@ static bool tryCanOutputByName(const char* name, int value) {
 
       return true;
     }
+  }
+
+  bool usedProfileInvert = false;
+  if (canManager.sendOutputByCommand(name, (uint8_t)(value ? 1 : 0), &usedProfileInvert)) {
+    enviar(String("📤 CAN PROFILE OUTPUT: ") +
+           String(name) +
+           "=" + String(value ? 1 : 0) +
+           (usedProfileInvert ? " INV" : ""));
+    return true;
   }
 
   return false;
@@ -4577,7 +4723,6 @@ void enableAP() {
   WiFi.mode(WIFI_AP);          // <- clave
   delay(100);
 
-  ensureWebAuthConfig();
   int channel = 1;             // 1..13
   bool hidden = false;
   int maxConn = 4;
@@ -4590,10 +4735,9 @@ void enableAP() {
                 ok ? 1 : 0, (int)WiFi.getMode(), WiFi.softAPSSID().c_str(), ip.toString().c_str());
 
   if (ok) {
-    ensureWirelessUpdateServer();
-    Serial.printf("🔄 OTA web: http://%s/update\n", ip.toString().c_str());
+    startDirectOtaServer();
+    Serial.printf("🚀 OTA TCP: %s:%u\n", ip.toString().c_str(), kOtaTcpPort);
     Serial.printf("🔐 AP password: %s\n", apPassword);
-    Serial.printf("🔐 Web/OTA auth: user=%s pass=%s\n", webAdminUser.c_str(), webAdminPass.c_str());
   }
 
   if (!wifiServerStarted) {
@@ -4873,9 +5017,10 @@ void setup() {
 
   canManager.begin(CAN_TX_PIN, CAN_RX_PIN, 500000);
   g_can_started = true;
+  canManager.registerProfile(&g_can_profile_asfad);
 
-  canManager.onInput([](uint8_t node, uint8_t channel, uint8_t value) {
-    handleCanInput(node, channel, value);
+  canManager.onInput([](uint8_t node, uint8_t channel, uint8_t value, const char* command) {
+    handleCanInput(node, channel, value, command);
   });
 
   canManager.onHello([](uint8_t node) {
@@ -5038,7 +5183,7 @@ void loop() {
   #endif
 
   tickModbus();
-  ElegantOTA.loop();
+  pollDirectOtaServer();
 
   #if defined(SSD1309)
   if (menu.isActive()) {

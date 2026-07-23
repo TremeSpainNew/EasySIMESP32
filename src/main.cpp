@@ -25,6 +25,7 @@
 
 #include "CanManager.h"
 #include <Profiles/ASFADigitalProfile.h>
+#include <Profiles/PZBProfile.h>
 
 #define CAN_TX_PIN GPIO_NUM_1
 #define CAN_RX_PIN GPIO_NUM_2
@@ -212,17 +213,23 @@ static unsigned long g_can_last_hello_ms = 0;
 static unsigned long g_can_last_hb_ms = 0;
 static unsigned long g_can_last_ack_ms = 0;
 static ASFADigitalProfile g_can_profile_asfad;
+static PZBProfile g_can_profile_pzb;
 
 bool ioWatchEnabled = false;
 uint8_t ioWatchPin = 0;
 char ioWatchKind[16] = "";
 int ioWatchLastValue = -9999;
+float ioWatchFilteredValue = NAN;
 unsigned long ioWatchLastMs = 0;
 
 static int lastSwitchState[EEPROM_MAX_ENTRIES];
 static int lastButtonState[EEPROM_MAX_ENTRIES];
 static int lastOutputState[EEPROM_MAX_ENTRIES];
 static int lastPotState[EEPROM_MAX_ENTRIES];
+static float ioPotStateFiltered[EEPROM_MAX_ENTRIES];
+
+static constexpr int   IO_POT_STATE_DELTA = 64;
+static constexpr float IO_POT_STATE_ALPHA = 0.20f;
 
 static unsigned long lastIoStateMs = 0;
 
@@ -1141,6 +1148,34 @@ static inline int logicalToPhysicalOutputValue(int logicalValue, bool inverted) 
 static inline int physicalToLogicalOutputValue(int physicalValue, bool inverted) {
   int value = physicalValue ? 1 : 0;
   return inverted ? (1 - value) : value;
+}
+
+static void publishAllOutputRegisters() {
+  uint8_t count = EE::read(0);
+
+  for (int i = 0; i < count && i < EEPROM_MAX_ENTRIES; i++) {
+    PinConfig cfg{};
+    EE_GET(1 + i * sizeof(PinConfig), cfg);
+
+    if (!isOutputConfigType(cfg.type) || !cfg.param[0]) continue;
+
+    bool alreadySent = false;
+    for (int j = 0; j < i; j++) {
+      PinConfig prev{};
+      EE_GET(1 + j * sizeof(PinConfig), prev);
+      if (!isOutputConfigType(prev.type)) continue;
+      if (strcasecmp(prev.param, cfg.param) == 0) {
+        alreadySent = true;
+        break;
+      }
+    }
+
+    if (!alreadySent) {
+      String reg = String("register(") + cfg.param + ")";
+      enviar(reg);
+      enviarServidor(reg);
+    }
+  }
 }
 
 static int getLocalOutputIndexByPin(uint8_t pin) {
@@ -2600,17 +2635,26 @@ void tickPots() {
           float thr  = potThreshold[i];
           bool enviarAhora = false;
 
-          if (isnan(prev)) enviarAhora = true;
-          else if (fabsf(outHybrid - prev) >= thr) enviarAhora = true;
+          if (cfg.enviarComoEntero) {
+            int currInt = (int)lroundf(outHybrid);
+            if (isnan(prev)) enviarAhora = true;
+            else {
+              int prevInt = (int)lroundf(prev);
+              enviarAhora = (currInt != prevInt);
+            }
+          } else {
+            if (isnan(prev)) enviarAhora = true;
+            else if (fabsf(outHybrid - prev) >= thr) enviarAhora = true;
+          }
 
           if (enviarAhora) {
             if (cfg.enviarComoEntero) {
-              enviarServidor(String(potParams[i]) + "=" + String((int)lroundf(outHybrid)));
+              enviar(String(potParams[i]) + "=" + String((int)lroundf(outHybrid)));
             } else {
               char f[24];
               dtostrf(outHybrid, 0, 3, f);
               char* p = f; while (*p==' ') ++p;
-              enviarServidor(String(potParams[i]) + "=" + String(p));
+              enviar(String(potParams[i]) + "=" + String(p));
             }
             potOutLast[i] = outHybrid;
             potLastMs[i]  = now;
@@ -2663,8 +2707,19 @@ void tickPots() {
           auto sendValueIfThresh = [&](const char* t, float x, float &lastRef) {
             const float thr = potThreshold[i];
             bool doSend = false;
-            if (isnan(lastRef)) doSend = true;
-            else if (fabsf(x - lastRef) >= thr) doSend = true;
+
+            if (cfg.enviarComoEntero) {
+              int currInt = (int)lroundf(x);
+              if (isnan(lastRef)) doSend = true;
+              else {
+                int prevInt = (int)lroundf(lastRef);
+                doSend = (currInt != prevInt);
+              }
+            } else {
+              if (isnan(lastRef)) doSend = true;
+              else if (fabsf(x - lastRef) >= thr) doSend = true;
+            }
+
             if (!doSend) return;
 
             if (cfg.enviarComoEntero) {
@@ -2797,8 +2852,18 @@ void tickPots() {
           {
             const float thr = potThreshold[i];
             bool doSend = false;
-            if (isnan(lastSingle[i])) doSend = true;
-            else if (fabsf(outSend - lastSingle[i]) >= thr) doSend = true;
+
+            if (cfg.enviarComoEntero) {
+              int currInt = (int)lroundf(outSend);
+              if (isnan(lastSingle[i])) doSend = true;
+              else {
+                int prevInt = (int)lroundf(lastSingle[i]);
+                doSend = (currInt != prevInt);
+              }
+            } else {
+              if (isnan(lastSingle[i])) doSend = true;
+              else if (fabsf(outSend - lastSingle[i]) >= thr) doSend = true;
+            }
 
             if (doSend) {
               if (cfg.enviarComoEntero) {
@@ -2826,8 +2891,17 @@ void tickPots() {
           float prev = potOutLast[i];
           float thr  = potThreshold[i];
 
-          if (isnan(prev)) enviarCambio = true;
-          else if (fabsf(outVal - prev) >= thr) enviarCambio = true;
+          if (cfg.enviarComoEntero) {
+            int currInt = (int)lroundf(outVal);
+            if (isnan(prev)) enviarCambio = true;
+            else {
+              int prevInt = (int)lroundf(prev);
+              enviarCambio = (currInt != prevInt);
+            }
+          } else {
+            if (isnan(prev)) enviarCambio = true;
+            else if (fabsf(outVal - prev) >= thr) enviarCambio = true;
+          }
 
           if (enviarCambio) {
             if (cfg.enviarComoEntero) {
@@ -2996,39 +3070,8 @@ void tickIoStates() {
     }
   }
 
-  // ===================== POTS =====================
-  for (int i = 0; i < potCount; i++) {
-    const PinConfig& cfg = potCfgs[i];
-
-    int value = 0;
-
-    if (isADSIndex(cfg.pin)) {
-      uint8_t ch = adsChannel(cfg.pin);
-
-      if (!g_ads_ok || ch > 3) continue;
-
-      if (adsCacheOk[ch]) {
-        value = adsRawCache[ch];
-      } else {
-        int16_t r = g_ads.readADC_SingleEnded(ch);
-        value = r < 0 ? 0 : (int)r;
-      }
-    } else {
-      value = analogRead(cfg.pin);
-    }
-
-    // Evita ruido analógico
-    if (lastPotState[i] == -9999 || abs(value - lastPotState[i]) > 8) {
-      lastPotState[i] = value;
-
-      enviar(
-        String("IO.STATE ") +
-        pinToStringForDump(cfg.pin, 3) +
-        " POT " +
-        String(value)
-      );
-    }
-  }
+  // Los POT no publican IO.STATE de forma automática.
+  // Para leerlos en vivo usa IO.READ o IO.WATCH.
 }
 
 void handleIoCommand(const String& cmd) {
@@ -3054,19 +3097,24 @@ void handleIoCommand(const String& cmd) {
       ioWatchKind[sizeof(ioWatchKind) - 1] = '\0';
 
       ioWatchLastValue = -9999;
+      ioWatchFilteredValue = NAN;
 
       int result = readIoLiveValue(ioWatchPin, ioWatchKind);
+      if (strcasecmp(ioWatchKind, "POT") == 0) {
+        ioWatchFilteredValue = (float)result;
+      }
       ioWatchLastValue = result;
+      ioWatchLastMs = millis();
 
       String pinText = pinToStringForIo(ioWatchPin, ioWatchKind);
       enviar(String("IO.WATCH OK ") + pinText + " " + ioWatchKind + " ON");
-      enviar(String("IO.STATE ") + pinText + " " + ioWatchKind + " " + result);
       return;
     }
 
     if (strcasecmp(state, "OFF") == 0 || strcmp(state, "0") == 0) {
       ioWatchEnabled = false;
       ioWatchLastValue = -9999;
+      ioWatchFilteredValue = NAN;
 
       String pinText = pinToStringForIo((uint8_t)pin, kind);
       enviar(String("IO.WATCH OK ") + pinText + " " + kind + " OFF");
@@ -3121,6 +3169,23 @@ void tickIoWatch() {
   ioWatchLastMs = now;
 
   int value = readIoLiveValue(ioWatchPin, ioWatchKind);
+
+  if (strcasecmp(ioWatchKind, "POT") == 0) {
+    if (isnan(ioWatchFilteredValue)) {
+      ioWatchFilteredValue = (float)value;
+    } else {
+      ioWatchFilteredValue =
+        (1.0f - IO_POT_STATE_ALPHA) * ioWatchFilteredValue +
+        IO_POT_STATE_ALPHA * (float)value;
+    }
+
+    value = (int)lroundf(ioWatchFilteredValue);
+
+    if (ioWatchLastValue != -9999 &&
+        abs(value - ioWatchLastValue) < IO_POT_STATE_DELTA) {
+      return;
+    }
+  }
 
   if (value != ioWatchLastValue) {
     ioWatchLastValue = value;
@@ -3281,6 +3346,26 @@ static bool tryCanOutputByName(const char* name, int value) {
            "=" + String(value ? 1 : 0) +
            (usedProfileInvert ? " INV" : ""));
     return true;
+  }
+
+  const char* sep = strstr(name, "::");
+  if (sep) {
+    String profileName = String(name).substring(0, (int)(sep - name));
+    const char* pinText = sep + 2;
+    char* endPtr = nullptr;
+    long pinValue = strtol(pinText, &endPtr, 10);
+
+    if (profileName.length() > 0 && endPtr && *endPtr == '\0' && pinValue >= 0 && pinValue <= 255) {
+      usedProfileInvert = false;
+      if (canManager.sendOutputByProfilePin(profileName.c_str(), (uint8_t)pinValue, (uint8_t)(value ? 1 : 0), &usedProfileInvert)) {
+        enviar(String("📤 CAN PROFILE PIN: ") +
+               profileName +
+               "::" + String(pinValue) +
+               "=" + String(value ? 1 : 0) +
+               (usedProfileInvert ? " INV" : ""));
+        return true;
+      }
+    }
   }
 
   return false;
@@ -4784,6 +4869,7 @@ void setup() {
   EE_ensureCountByte();
 
   for (int i=0;i<EEPROM_MAX_ENTRIES;i++){
+    ioPotStateFiltered[i]=NAN;
     potEMA[i]=NAN;
     potOutLast[i]=NAN;
     potLastMs[i]=0;
@@ -4954,11 +5040,7 @@ void setup() {
     enviar(String("✅ CLIENT.CONNECT OK → ") +
           ip.toString() + ":" + String(port));
 
-    for (int i = 0; i < outputCount; i++) {
-      if (outputParams[i]) {
-        enviar(String("register(") + outputParams[i] + ")");
-      }
-    }
+    publishAllOutputRegisters();
 
     mbRegisterAllTags();
   });
@@ -5018,6 +5100,7 @@ void setup() {
   canManager.begin(CAN_TX_PIN, CAN_RX_PIN, 500000);
   g_can_started = true;
   canManager.registerProfile(&g_can_profile_asfad);
+  canManager.registerProfile(&g_can_profile_pzb);
 
   canManager.onInput([](uint8_t node, uint8_t channel, uint8_t value, const char* command) {
     handleCanInput(node, channel, value, command);
@@ -5105,8 +5188,8 @@ void setup() {
   for (int i = 0; i < outputCount; i++) {
     outputs[i]->begin();
     writeLocalOutputByIndex(i, 0);
-    enviar(String("register(") + outputParams[i] + ")");
   }
+  publishAllOutputRegisters();
   for (int i = 0; i < selectorCount; i++) {
     if (selectors[i]) selectors[i]->begin();
   }

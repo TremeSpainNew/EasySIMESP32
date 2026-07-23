@@ -22,6 +22,7 @@ public:
 
   bool sendOutputSet(uint8_t node, uint8_t channel, uint8_t value);
   bool sendOutputByCommand(const char* command, uint8_t value, bool* usedProfileInvert = nullptr);
+  bool sendOutputByProfilePin(const char* profileName, uint8_t pin, uint8_t value, bool* usedProfileInvert = nullptr);
   bool sendHeartbeat(uint8_t node);
   bool sendHello(uint8_t node, uint8_t inputs, uint8_t outputs);
   void registerProfile(EasySimCANProfile* profile);

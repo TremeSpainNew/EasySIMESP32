@@ -109,6 +109,45 @@ bool CanManager::sendOutputByCommand(const char* command, uint8_t value, bool* u
   return false;
 }
 
+bool CanManager::sendOutputByProfilePin(const char* profileName, uint8_t pin, uint8_t value, bool* usedProfileInvert) {
+  if (usedProfileInvert) {
+    *usedProfileInvert = false;
+  }
+
+  if (!started || !profileName || !profileName[0]) return false;
+
+  for (uint8_t node = 0; node < 128; ++node) {
+    const EasySimCANNodeInfo* info = can.nodeInfo(node);
+    if (!info || !info->online) continue;
+
+    const EasySimCANProfile* profile = registeredProfileByType(info->profile);
+    if (!profile) continue;
+    if (strcasecmp(profile->name(), profileName) != 0) continue;
+
+    const EasySimCANPinConfig* pinCfg = profile->pinByGlobalPin(pin);
+    if (!pinCfg) continue;
+    if (pinCfg->mode != EasySimCANPinMode::OUTPUT_MODE) continue;
+
+    uint8_t finalValue = value ? 1 : 0;
+    if (pinCfg->inverted) {
+      finalValue = finalValue ? 0 : 1;
+      if (usedProfileInvert) {
+        *usedProfileInvert = true;
+      }
+    }
+
+    can.sendDigitalOutput(node, pinCfg->globalPin, finalValue);
+
+    if (outputAckCb) {
+      outputAckCb(node, pinCfg->globalPin, finalValue);
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
 bool CanManager::sendHeartbeat(uint8_t node) {
   uint8_t data[1] = { node };
   return sendLegacyFrame(EASY_CAN_ID_HEARTBEAT, data, 1);

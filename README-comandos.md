@@ -24,7 +24,7 @@ Resumen de comandos aceptados por `handleLine()` en el firmware de `EasySIMESP32
 
 | Comando | Requiere `#CONFIG` | Ejemplo | Respuesta esperada |
 |---|---|---|---|
-| `IO.WATCH <pin> <kind> ON` | No | `IO.WATCH ADS0 POT ON` | `IO.WATCH OK ...` + `IO.STATE ...` |
+| `IO.WATCH <pin> <kind> ON` | No | `IO.WATCH ADS0 POT ON` | `IO.WATCH OK ...` |
 | `IO.WATCH <pin> <kind> OFF` | No | `IO.WATCH ADS0 POT OFF` | `IO.WATCH OK ... OFF` |
 | `IO.READ <pin> <kind>` | No | `IO.READ 12 BUTTON` | `IO.STATE ...` |
 | `IO.WRITE <pin> <0/1>` | No | `IO.WRITE 7 1` | `IO.STATE 7 OUTPUT 1` |
@@ -32,6 +32,11 @@ Resumen de comandos aceptados por `handleLine()` en el firmware de `EasySIMESP32
 Notas:
 - Para potenciómetros ADS usa `ADS0`, `ADS1`, etc.
 - `kind` puede ser `BUTTON`, `SWITCH`, `OUTPUT`, `POT` o `SELECTOR`.
+- Los `POT` no publican `IO.STATE` de forma automática en el escaneo general; para leerlos usa `IO.READ` o `IO.WATCH`.
+- `IO.WATCH ... ON` ya no emite un `IO.STATE` inmediato al activarse; solo responde `IO.WATCH OK ...` y después publica cambios detectados.
+- En `POT` con `ADS1115`, el watch aplica filtrado software e histéresis para evitar ruido residual.
+- El `ADS1115` no es ratiométrico: si el pot se alimenta desde un `3.3V` ruidoso, el cursor hereda esa variación y se verá como movimiento. Para lecturas estables, alimenta el pot desde una rama analógica limpia y comparte la misma masa del ADS.
+- Recomendación práctica para la rama analógica del pot: `3.3V -> ferrita o 10 ohm -> (10 uF + 100 nF a GND)` y, en el cursor hacia `ADS0`, `1k` en serie + `100 nF` o `470 nF` a GND cerca del ADS.
 
 ## Red y Ethernet
 
